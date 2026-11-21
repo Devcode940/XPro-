@@ -1,0 +1,117 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidBookmark(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.title is string &&
+             data.title.size() <= 300 &&
+             data.content is string &&
+             data.content.size() >= 1 &&
+             data.content.size() <= 5000 &&
+             data.authorName is string &&
+             data.authorName.size() >= 1 &&
+             data.authorName.size() <= 120 &&
+             data.authorHandle is string &&
+             data.authorHandle.size() >= 1 &&
+             data.authorHandle.size() <= 80 &&
+             data.itemType is string &&
+             data.itemType in ['POST', 'VIDEO', 'IMAGE', 'LINK'] &&
+             (!('mediaUrl' in data) || (data.mediaUrl is string && data.mediaUrl.size() <= 1000)) &&
+             (!('linkUrl' in data) || (data.linkUrl is string && data.linkUrl.size() <= 1000)) &&
+             (!('folderId' in data) || (data.folderId is string && isValidId(data.folderId)));
+    }
+
+    function isValidBookmarkFolder(data, userId) {
+      return data.userId is string &&
+             data.userId == userId &&
+             data.name is string &&
+             data.name.size() >= 1 &&
+             data.name.size() <= 60 &&
+             data.description is string &&
+             data.description.size() <= 200 &&
+             data.colorHex is int &&
+             data.iconKey is string &&
+             data.iconKey.size() >= 1 &&
+             data.iconKey.size() <= 40;
+    }
+
+    match /users/{userId}/bookmarks/{bookmarkId} {
+      allow get: if isOwner(userId) && isValidId(bookmarkId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(bookmarkId) &&
+                       incoming().keys().hasAll(['userId', 'title', 'content', 'authorName', 'authorHandle', 'itemType', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'title', 'content', 'authorName', 'authorHandle', 'itemType', 'mediaUrl', 'linkUrl', 'folderId', 'createdAt', 'updatedAt']) &&
+                       incoming().createdAt is timestamp &&
+                       incoming().createdAt <= request.time &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       isValidBookmark(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(bookmarkId) &&
+                       isValidBookmark(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['title', 'content', 'itemType', 'mediaUrl', 'linkUrl', 'folderId', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(bookmarkId);
+    }
+
+    match /users/{userId}/bookmark_folders/{folderId} {
+      allow get: if isOwner(userId) && isValidId(folderId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(folderId) &&
+                       incoming().keys().hasAll(['userId', 'name', 'description', 'colorHex', 'iconKey', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'name', 'description', 'colorHex', 'iconKey', 'createdAt', 'updatedAt']) &&
+                       incoming().createdAt is timestamp &&
+                       incoming().createdAt <= request.time &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       isValidBookmarkFolder(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(folderId) &&
+                       isValidBookmarkFolder(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'colorHex', 'iconKey', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(folderId);
+    }
+  }
+}

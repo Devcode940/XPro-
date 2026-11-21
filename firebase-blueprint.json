@@ -1,0 +1,111 @@
+{
+  "entities": {
+    "UserBookmark": {
+      "title": "UserBookmark",
+      "description": "A user-saved bookmark item synced between local Room cache and Firestore.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner UID matching request.auth.uid"
+        },
+        "title": {
+          "type": "string",
+          "description": "Headline or bookmark label"
+        },
+        "content": {
+          "type": "string",
+          "description": "Post text or item summary"
+        },
+        "authorName": {
+          "type": "string",
+          "description": "Author display name or source name"
+        },
+        "authorHandle": {
+          "type": "string",
+          "description": "Author handle or domain"
+        },
+        "itemType": {
+          "type": "string",
+          "enum": ["POST", "VIDEO", "IMAGE", "LINK"],
+          "description": "Bookmark category"
+        },
+        "mediaUrl": {
+          "type": "string",
+          "description": "Optional remote media URL"
+        },
+        "linkUrl": {
+          "type": "string",
+          "description": "Optional saved link URL"
+        },
+        "folderId": {
+          "type": "string",
+          "description": "Optional collection/folder identifier"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (FieldValue.serverTimestamp())"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated (FieldValue.serverTimestamp())"
+        }
+      },
+      "required": ["userId", "title", "content", "authorName", "authorHandle", "itemType", "createdAt", "updatedAt"]
+    },
+    "UserBookmarkFolder": {
+      "title": "UserBookmarkFolder",
+      "description": "A user-created collection folder for organizing bookmarks.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner UID matching request.auth.uid"
+        },
+        "name": {
+          "type": "string",
+          "description": "Collection folder name"
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional collection description"
+        },
+        "colorHex": {
+          "type": "integer",
+          "description": "ARGB accent color integer"
+        },
+        "iconKey": {
+          "type": "string",
+          "description": "Icon identifier"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (FieldValue.serverTimestamp())"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated (FieldValue.serverTimestamp())"
+        }
+      },
+      "required": ["userId", "name", "description", "colorHex", "iconKey", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/bookmarks/{bookmarkId}": {
+      "schema": {
+        "$ref": "#/entities/UserBookmark"
+      },
+      "description": "Per-user synced bookmarks across posts, videos, images, and links."
+    },
+    "/users/{userId}/bookmark_folders/{folderId}": {
+      "schema": {
+        "$ref": "#/entities/UserBookmarkFolder"
+      },
+      "description": "Per-user bookmark collections."
+    }
+  }
+}

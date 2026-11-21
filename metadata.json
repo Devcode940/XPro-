@@ -1,0 +1,6 @@
+{
+  "name": "XPro",
+  "description": "Ad-free X Pro client with unlocked Premium capabilities: custom badges, post editing with diff history, undo send, long-form articles, thread reader mode, and bookmark folders.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

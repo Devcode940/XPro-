@@ -73,3 +73,20 @@ jobs:
         run: |
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           gradle :app:testDebugUnitTest :media-downloader:testDebugUnitTest --stacktrace
+
+      # R8 + resource shrinking only run in release builds, so nothing above would notice a
+      # keep-rule or shrinking problem. Sign with a throwaway upload keystore that matches the
+      # `release` signingConfig (app/build.gradle.kts reads these env vars).
+      - name: Assemble release APK (R8 smoke test)
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/ci-upload-key.jks
+          STORE_PASSWORD: ci-store-password
+          KEY_PASSWORD: ci-key-password
+        run: |
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          keytool -genkeypair -v -keystore "$KEYSTORE_PATH" -alias upload \
+            -storepass "$STORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+            -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname "CN=CI Upload,O=XPro,C=US"
+          gradle :app:assembleRelease --stacktrace
+          ls -l app/build/outputs/apk/release/

@@ -42,7 +42,7 @@ data class DownloadsUiState(
 
 class DownloadsViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val downloader = SystemMediaDownloader(application)
+    private val downloader = SystemMediaDownloader.getInstance(application)
     private val settingsRepo = SettingsRepository(application)
 
     private val selectedTab = MutableStateFlow(DownloadsFilterTab.ALL)
@@ -194,7 +194,9 @@ class DownloadsViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     override fun onCleared() {
-        downloader.cleanup()
+        // The downloader is process-scoped; detach this screen's callback instead of
+        // unregistering the shared completion receiver.
+        downloader.release()
         super.onCleared()
     }
 }

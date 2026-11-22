@@ -63,7 +63,8 @@ class MediaDownloaderTest {
     @Test
     fun `enqueues download deduplicates filename and persists queue across restarts`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val downloader = SystemMediaDownloader(context)
+        SystemMediaDownloader.resetInstanceForTesting()
+        val downloader = SystemMediaDownloader.getInstance(context)
         downloader.clearHistory()
 
         var startedItem: MediaDownloadItem? = null
@@ -94,12 +95,40 @@ class MediaDownloaderTest {
         assertTrue(second.isSuccess)
         assertEquals("sample_2.mp4", second.getOrNull()?.fileName)
         assertEquals(2, downloader.downloads.value.size)
-        downloader.cleanup()
-
-        val restoredDownloader = SystemMediaDownloader(context)
+        // A fresh instance reads the persisted queue back (process restart simulation).
+        SystemMediaDownloader.resetInstanceForTesting()
+        val restoredDownloader = SystemMediaDownloader.getInstance(context)
         assertEquals(2, restoredDownloader.downloads.value.size)
         restoredDownloader.clearHistory()
         assertTrue(restoredDownloader.downloads.value.isEmpty())
-        restoredDownloader.cleanup()
+        SystemMediaDownloader.resetInstanceForTesting()
+    }
+
+    @Test
+    fun `every caller shares one queue and one persistence writer`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        SystemMediaDownloader.resetInstanceForTesting()
+
+        val downloadsScreen = SystemMediaDownloader.getInstance(context)
+        val settingsScreen = SystemMediaDownloader.getInstance(context)
+        downloadsScreen.clearHistory()
+
+        assertTrue(
+            "settings must observe the same queue as the downloads screen",
+            downloadsScreen === settingsScreen
+        )
+
+        downloadsScreen.enqueueDownload(
+            url = "https://example.com/shared.mp4",
+            mediaType = SupportedMediaType.MP4,
+            fileName = "shared.mp4"
+        )
+        assertEquals(1, settingsScreen.downloads.value.size)
+
+        // A second writer used to clobber the shared prefs blob with its own stale list.
+        settingsScreen.refreshActiveDownloads()
+        assertEquals(1, downloadsScreen.downloads.value.size)
+
+        SystemMediaDownloader.resetInstanceForTesting()
     }
 }

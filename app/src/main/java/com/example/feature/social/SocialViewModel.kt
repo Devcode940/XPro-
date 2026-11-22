@@ -20,6 +20,25 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+private data class SocialQuery(
+    val query: String,
+    val unreadOnly: Boolean,
+    val notifications: List<NotificationItem>
+)
+
+private data class SocialInbox(
+    val conversations: List<MessageConversation>,
+    val lists: List<XListItem>,
+    val communities: List<CommunityItem>
+)
+
+private data class SocialDiscovery(
+    val trends: List<TrendItem>,
+    val posts: List<PostItem>,
+    val suggestedUsers: List<SuggestedUser>,
+    val adFreeEnabled: Boolean
+)
+
 data class SocialUiState(
     val searchQuery: String = "",
     val unreadOnlyNotifications: Boolean = false,
@@ -92,32 +111,36 @@ class SocialViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { repo.ensureSeeded() }
     }
 
+    /** Grouped `combine` to keep element types — see BookmarksViewModel for the rationale. */
     val uiState: StateFlow<SocialUiState> = combine(
-        searchQuery,
-        unreadOnly,
-        repo.notifications,
-        repo.conversations,
-        repo.xLists,
-        repo.communities,
-        repo.trends,
-        repo.allPosts,
-        repo.suggestedUsers,
-        repo.userProfile,
+        combine(searchQuery, unreadOnly, repo.notifications) { query, unread, notifications ->
+            SocialQuery(query = query, unreadOnly = unread, notifications = notifications)
+        },
+        combine(repo.conversations, repo.xLists, repo.communities) { conversations, lists, communities ->
+            SocialInbox(conversations = conversations, lists = lists, communities = communities)
+        },
+        combine(repo.trends, repo.allPosts, repo.suggestedUsers, repo.userProfile) { trends, posts, suggested, profile ->
+            SocialDiscovery(
+                trends = trends,
+                posts = posts,
+                suggestedUsers = suggested,
+                adFreeEnabled = profile.adFreeEnabled
+            )
+        },
         bannerState
-    ) { values ->
-        @Suppress("UNCHECKED_CAST")
+    ) { query, inbox, discovery, banner ->
         SocialUiState(
-            searchQuery = values[0] as String,
-            unreadOnlyNotifications = values[1] as Boolean,
-            notifications = values[2] as List<NotificationItem>,
-            conversations = values[3] as List<MessageConversation>,
-            lists = values[4] as List<XListItem>,
-            communities = values[5] as List<CommunityItem>,
-            trends = values[6] as List<TrendItem>,
-            posts = values[7] as List<PostItem>,
-            suggestedUsers = values[8] as List<SuggestedUser>,
-            adFreeEnabled = (values[9] as com.example.data.model.UserProfile).adFreeEnabled,
-            statusBanner = values[10] as String?
+            searchQuery = query.query,
+            unreadOnlyNotifications = query.unreadOnly,
+            notifications = query.notifications,
+            conversations = inbox.conversations,
+            lists = inbox.lists,
+            communities = inbox.communities,
+            trends = discovery.trends,
+            posts = discovery.posts,
+            suggestedUsers = discovery.suggestedUsers,
+            adFreeEnabled = discovery.adFreeEnabled,
+            statusBanner = banner
         )
     }.stateIn(
         scope = viewModelScope,

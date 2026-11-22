@@ -22,6 +22,19 @@ enum class MediaFilterKind(val label: String) {
     AUDIO("Audio")
 }
 
+private data class MediaCatalog(
+    val filterKind: MediaFilterKind,
+    val allItems: List<MediaLibraryItem>,
+    val playlists: List<PlaylistItem>,
+    val activeMediaId: String?
+)
+
+private data class MediaPlayback(
+    val customStreamUrl: String?,
+    val settings: UserSettingsState,
+    val banner: String?
+)
+
 data class MediaCenterUiState(
     val filterKind: MediaFilterKind = MediaFilterKind.ALL,
     val allItems: List<MediaLibraryItem> = emptyList(),
@@ -71,24 +84,33 @@ class MediaCenterViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch { repo.ensureSeeded() }
     }
 
+    /** Grouped `combine` to keep element types — see BookmarksViewModel for the rationale. */
     val uiState: StateFlow<MediaCenterUiState> = combine(
-        filterKind,
-        repo.mediaLibrary,
-        repo.playlists,
-        activeMediaId,
-        customStreamUrl,
-        settingsRepo.settingsFlow,
-        bannerState
-    ) { values ->
-        @Suppress("UNCHECKED_CAST")
+        combine(
+            filterKind,
+            repo.mediaLibrary,
+            repo.playlists,
+            activeMediaId
+        ) { kind, items, playlists, activeId ->
+            MediaCatalog(
+                filterKind = kind,
+                allItems = items,
+                playlists = playlists,
+                activeMediaId = activeId
+            )
+        },
+        combine(customStreamUrl, settingsRepo.settingsFlow, bannerState) { url, settings, banner ->
+            MediaPlayback(customStreamUrl = url, settings = settings, banner = banner)
+        }
+    ) { catalog, playback ->
         MediaCenterUiState(
-            filterKind = values[0] as MediaFilterKind,
-            allItems = values[1] as List<MediaLibraryItem>,
-            playlists = values[2] as List<PlaylistItem>,
-            activeMediaId = values[3] as String?,
-            customStreamUrl = values[4] as String?,
-            settings = values[5] as UserSettingsState,
-            statusBanner = values[6] as String?
+            filterKind = catalog.filterKind,
+            allItems = catalog.allItems,
+            playlists = catalog.playlists,
+            activeMediaId = catalog.activeMediaId,
+            customStreamUrl = playback.customStreamUrl,
+            settings = playback.settings,
+            statusBanner = playback.banner
         )
     }.stateIn(
         scope = viewModelScope,

@@ -129,6 +129,23 @@ private data class UiControlState(
     val toastMessage: String? = null
 )
 
+private data class FeedSession(
+    val controls: UiControlState,
+    val profile: UserProfile
+)
+
+private data class FeedLibrary(
+    val posts: List<PostItem>,
+    val folders: List<BookmarkFolder>,
+    val trends: List<TrendItem>,
+    val suggestedUsers: List<SuggestedUser>
+)
+
+private data class FeedOffline(
+    val cachedCount: Int,
+    val unreadCount: Int
+)
+
 private data class FeedQueryKey(
     val feedTab: FeedTab,
     val feedFilter: FeedFilter,
@@ -233,28 +250,31 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
         }
         .cachedIn(viewModelScope)
 
+    /** Grouped `combine` to keep element types — see BookmarksViewModel for the rationale. */
     val uiState: StateFlow<XProUiState> = combine(
-        controls,
-        repository.userProfile,
-        repository.allPosts,
-        repository.bookmarkFolders,
-        repository.trends,
-        repository.suggestedUsers,
-        repository.offlineCachedCount,
-        repository.offlineUnreadCount
-    ) { values ->
-        val ctrl = values[0] as UiControlState
-        val profile = values[1] as UserProfile
-        @Suppress("UNCHECKED_CAST")
-        val posts = values[2] as List<PostItem>
-        @Suppress("UNCHECKED_CAST")
-        val folders = values[3] as List<BookmarkFolder>
-        @Suppress("UNCHECKED_CAST")
-        val trends = values[4] as List<TrendItem>
-        @Suppress("UNCHECKED_CAST")
-        val suggested = values[5] as List<SuggestedUser>
-        val cachedCount = values[6] as Int
-        val unreadCount = values[7] as Int
+        combine(controls, repository.userProfile) { controlState, profile ->
+            FeedSession(controls = controlState, profile = profile)
+        },
+        combine(
+            repository.allPosts,
+            repository.bookmarkFolders,
+            repository.trends,
+            repository.suggestedUsers
+        ) { posts, folders, trends, suggested ->
+            FeedLibrary(posts = posts, folders = folders, trends = trends, suggestedUsers = suggested)
+        },
+        combine(repository.offlineCachedCount, repository.offlineUnreadCount) { cached, unread ->
+            FeedOffline(cachedCount = cached, unreadCount = unread)
+        }
+    ) { session, library, offline ->
+        val ctrl = session.controls
+        val profile = session.profile
+        val posts = library.posts
+        val folders = library.folders
+        val trends = library.trends
+        val suggested = library.suggestedUsers
+        val cachedCount = offline.cachedCount
+        val unreadCount = offline.unreadCount
 
         val adFree = profile.adFreeEnabled
         val adFilteredPosts = if (adFree) posts.filterNot { it.isSponsored } else posts

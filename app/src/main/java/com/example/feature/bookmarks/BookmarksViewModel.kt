@@ -46,6 +46,26 @@ private data class RemoteState(
     val folders: FirestoreSyncResult<List<com.example.data.remote.SyncedBookmarkFolderDoc>>?
 )
 
+private data class BookmarkFilters(
+    val category: BookmarkFilterCategory,
+    val folderId: String?,
+    val query: String
+)
+
+private data class BookmarkContent(
+    val folders: List<BookmarkFolder>,
+    val typed: List<TypedBookmarkItem>,
+    val posts: List<PostItem>,
+    val readLater: List<PostItem>
+)
+
+private data class BookmarkSync(
+    val uid: String?,
+    val isSyncing: Boolean,
+    val syncError: String?,
+    val banner: String?
+)
+
 data class BookmarksUiState(
     val selectedCategory: BookmarkFilterCategory = BookmarkFilterCategory.ALL,
     val selectedFolderId: String? = null,
@@ -230,33 +250,36 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * Grouped `combine`, not a 10-arity vararg: the vararg overload erases the element types, and
+     * indexing it with `values[n] as T` turns "someone reordered the flows" into a
+     * ClassCastException at runtime instead of a compile error.
+     */
     val uiState: StateFlow<BookmarksUiState> = combine(
-        selectedCategory,
-        selectedFolderId,
-        searchQuery,
-        localRepo.bookmarkFolders,
-        localRepo.typedBookmarks,
-        localRepo.allPosts,
-        localRepo.readLaterPosts,
-        activeUid,
-        syncStatus,
-        bannerState
-    ) { values ->
-        val category = values[0] as BookmarkFilterCategory
-        val folderId = values[1] as String?
-        val query = values[2] as String
-        @Suppress("UNCHECKED_CAST")
-        val folders = values[3] as List<BookmarkFolder>
-        @Suppress("UNCHECKED_CAST")
-        val typed = values[4] as List<TypedBookmarkItem>
-        @Suppress("UNCHECKED_CAST")
-        val posts = values[5] as List<PostItem>
-        @Suppress("UNCHECKED_CAST")
-        val readLater = values[6] as List<PostItem>
-        val uid = values[7] as String?
-        @Suppress("UNCHECKED_CAST")
-        val sync = values[8] as Pair<Boolean, String?>
-        val banner = values[9] as String?
+        combine(selectedCategory, selectedFolderId, searchQuery) { category, folderId, query ->
+            BookmarkFilters(category = category, folderId = folderId, query = query)
+        },
+        combine(
+            localRepo.bookmarkFolders,
+            localRepo.typedBookmarks,
+            localRepo.allPosts,
+            localRepo.readLaterPosts
+        ) { folders, typed, posts, readLater ->
+            BookmarkContent(folders = folders, typed = typed, posts = posts, readLater = readLater)
+        },
+        combine(activeUid, syncStatus, bannerState) { uid, sync, banner ->
+            BookmarkSync(uid = uid, isSyncing = sync.first, syncError = sync.second, banner = banner)
+        }
+    ) { filters, content, sync ->
+        val category = filters.category
+        val folderId = filters.folderId
+        val query = filters.query
+        val folders = content.folders
+        val typed = content.typed
+        val posts = content.posts
+        val readLater = content.readLater
+        val uid = sync.uid
+        val banner = sync.banner
 
         val filteredTyped = typed.filter { item ->
             val matchesCategory = when (category) {
@@ -299,8 +322,8 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
             savedPosts = bookmarkedPosts,
             readLaterPosts = filteredReadLater,
             isAuthenticated = !uid.isNullOrBlank(),
-            isSyncing = sync.first,
-            syncError = sync.second,
+            isSyncing = sync.isSyncing,
+            syncError = sync.syncError,
             statusBanner = banner
         )
     }.stateIn(

@@ -29,6 +29,18 @@ enum class DownloadsFilterTab(val label: String) {
     FAILED("Failed")
 }
 
+private data class DownloadInput(
+    val tab: DownloadsFilterTab,
+    val url: String,
+    val validationResult: UrlValidationResult?
+)
+
+private data class DownloadData(
+    val all: List<MediaDownloadItem>,
+    val settings: UserSettingsState,
+    val banner: Pair<String?, Boolean>
+)
+
 data class DownloadsUiState(
     val selectedTab: DownloadsFilterTab = DownloadsFilterTab.ALL,
     val urlInput: String = "",
@@ -78,22 +90,21 @@ class DownloadsViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /** Grouped `combine` to keep element types — see BookmarksViewModel for the rationale. */
     val uiState: StateFlow<DownloadsUiState> = combine(
-        selectedTab,
-        urlInput,
-        validation,
-        downloader.downloads,
-        settingsRepo.settingsFlow,
-        banner
-    ) { values ->
-        val tab = values[0] as DownloadsFilterTab
-        val url = values[1] as String
-        val valResult = values[2] as UrlValidationResult?
-        @Suppress("UNCHECKED_CAST")
-        val all = values[3] as List<MediaDownloadItem>
-        val settings = values[4] as UserSettingsState
-        @Suppress("UNCHECKED_CAST")
-        val bannerPair = values[5] as Pair<String?, Boolean>
+        combine(selectedTab, urlInput, validation) { tab, url, result ->
+            DownloadInput(tab = tab, url = url, validationResult = result)
+        },
+        combine(downloader.downloads, settingsRepo.settingsFlow, banner) { all, settings, bannerPair ->
+            DownloadData(all = all, settings = settings, banner = bannerPair)
+        }
+    ) { input, data ->
+        val tab = input.tab
+        val url = input.url
+        val valResult = input.validationResult
+        val all = data.all
+        val settings = data.settings
+        val bannerPair = data.banner
 
         val filtered = when (tab) {
             DownloadsFilterTab.ALL -> all

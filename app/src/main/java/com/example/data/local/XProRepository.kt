@@ -555,6 +555,27 @@ class XProRepository(private val dao: XProDao) {
         if (ownerUid.isNotBlank() && ids.isNotEmpty()) dao.clearPendingFolders(ownerUid, ids)
     }
 
+    /**
+     * True when [rowOwnerUid]'s remote copy may be written through [uid].
+     *
+     * Unowned rows (`null`) are device-local and are adopted on sign-in; a row owned by a
+     * different account must never be pushed, updated or deleted on this account's behalf.
+     */
+    fun isRemoteCopyOwnedBy(rowOwnerUid: String?, uid: String?): Boolean =
+        !uid.isNullOrBlank() && (rowOwnerUid == null || rowOwnerUid == uid)
+
+    /** Owner of a vault row, read *before* deleting it so the caller can scope the remote delete. */
+    suspend fun typedBookmarkOwner(bookmarkId: String): String? =
+        dao.getTypedBookmarkById(bookmarkId)?.ownerUid
+
+    /** Owner of the vault row linked to [postId], if any. */
+    suspend fun postBookmarkOwner(postId: String): String? =
+        dao.getTypedBookmarkByPostId(postId)?.ownerUid
+
+    /** Owner of a folder row, read *before* deleting it. */
+    suspend fun folderOwner(folderId: String): String? =
+        dao.getBookmarkFolderById(folderId)?.ownerUid
+
     /** Keeps every SQL `IN (...)` under SQLite's bound-parameter limit on large libraries. */
     private suspend fun deleteInChunks(ids: List<String>, delete: suspend (List<String>) -> Unit) {
         ids.chunked(SQL_IN_CHUNK_SIZE).forEach { chunk -> delete(chunk) }

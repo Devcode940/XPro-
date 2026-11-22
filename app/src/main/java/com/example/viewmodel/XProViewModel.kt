@@ -657,8 +657,11 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
 
     fun removeBookmark(postId: String) {
         viewModelScope.launch {
+            // Read the owner first: a row left over from another account must not delete this
+            // account's document with the same id.
+            val owner = repository.postBookmarkOwner(postId)
             repository.removeBookmark(postId)
-            pushBookmarkDelete("tb_$postId")
+            if (repository.isRemoteCopyOwnedBy(owner, cloudUid)) pushBookmarkDelete("tb_$postId")
             controls.update { it.copy(bookmarkTargetPost = null) }
             showToast("Removed from bookmarks")
         }
@@ -694,8 +697,9 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteBookmarkFolder(folderId: String) {
         viewModelScope.launch {
+            val owner = repository.folderOwner(folderId)
             repository.deleteBookmarkFolder(folderId)
-            pushFolderDelete(folderId)
+            if (repository.isRemoteCopyOwnedBy(owner, cloudUid)) pushFolderDelete(folderId)
             if (controls.value.selectedFolderId == folderId) {
                 controls.update { it.copy(selectedFolderId = null) }
             }

@@ -254,6 +254,27 @@ class SyncMergeTest {
     }
 
     @Test
+    fun `remote write-through is only allowed for rows owned by the active account`() = runBlocking {
+        repository.setActiveOwner(alice)
+        repository.addTypedBookmark(
+            itemType = BookmarkItemType.LINK,
+            title = "Alice owned",
+            content = "stamped with alice",
+            authorName = "Alice",
+            authorHandle = "@alice",
+            customId = "tb_owner_probe"
+        )
+
+        val owner = repository.typedBookmarkOwner("tb_owner_probe")
+        assertEquals(alice, owner)
+        assertTrue(repository.isRemoteCopyOwnedBy(owner, alice))
+        assertFalse("bob must not delete alice's remote copy", repository.isRemoteCopyOwnedBy(owner, bob))
+        assertFalse("guest mode never writes remotely", repository.isRemoteCopyOwnedBy(owner, null))
+        // Unclaimed (device-local) rows may be adopted by whoever signs in.
+        assertTrue(repository.isRemoteCopyOwnedBy(null, bob))
+    }
+
+    @Test
     fun `deleting a playlist detaches media items that referenced it`() = runBlocking {
         repository.createPlaylist("Mixtape", "Test playlist")
         val playlist = repository.playlists.first().first { it.name == "Mixtape" }

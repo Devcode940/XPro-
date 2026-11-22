@@ -431,9 +431,12 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun removeTypedBookmark(bookmark: TypedBookmarkItem) {
         viewModelScope.launch {
+            // Owner is read before the row disappears; rows owned by another account keep their
+            // tombstone for that account's next sync instead of touching this account's cloud.
+            val owner = localRepo.typedBookmarkOwner(bookmark.id)
             localRepo.deleteTypedBookmark(bookmark.id, bookmark.postId)
             val uid = activeUid.value
-            if (uid != null) {
+            if (uid != null && localRepo.isRemoteCopyOwnedBy(owner, uid)) {
                 when (firestoreRepo.deleteBookmark(uid, bookmark.id)) {
                     SyncWriteResult.Synced -> localRepo.clearPendingRemoteDelete(bookmark.id)
                     is SyncWriteResult.Failed -> Unit // tombstone kept; replayed on next sync
@@ -446,12 +449,13 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteCollection(folderId: String) {
         viewModelScope.launch {
+            val owner = localRepo.folderOwner(folderId)
             localRepo.deleteBookmarkFolder(folderId)
             if (selectedFolderId.value == folderId) {
                 selectedFolderId.value = null
             }
             val uid = activeUid.value
-            if (uid != null) {
+            if (uid != null && localRepo.isRemoteCopyOwnedBy(owner, uid)) {
                 when (firestoreRepo.deleteFolder(uid, folderId)) {
                     SyncWriteResult.Synced -> localRepo.clearPendingRemoteDelete(folderId)
                     is SyncWriteResult.Failed -> Unit // tombstone kept; replayed on next sync

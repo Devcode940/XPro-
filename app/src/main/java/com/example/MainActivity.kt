@@ -268,6 +268,7 @@ fun XProApp(
 
     LaunchedEffect(authUid) {
         bookmarksViewModel.setAuthenticatedUid(authUid)
+        viewModel.setCloudSyncUid(authUid)
     }
 
     val activeDownloadsCount = downloadsState.allDownloads.count {

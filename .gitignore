@@ -18,3 +18,23 @@ local.properties
 debug.keystore
 *-debug.log
 
+
+# --- Secrets & local config (never commit) ---
+google-services.json
+*.jks
+*.keystore
+keystore.properties
+local.properties
+
+# --- Firebase tooling ---
+.firebaserc
+.firebase/
+firebase-debug.log*
+firestore-debug.log*
+database-debug.log*
+ui-debug.log*
+
+# --- Node (Firestore rules tests) ---
+node_modules/
+
+# --- Room schema export is generated, but MUST be committed (needed for migration tests) ---

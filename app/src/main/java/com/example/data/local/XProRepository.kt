@@ -5,6 +5,7 @@ import androidx.paging.Pager
 import androidx.paging.PagingConfig
 import androidx.paging.PagingData
 import androidx.paging.map
+import com.example.BuildConfig
 import com.example.data.model.BookmarkFolder
 import com.example.data.model.BookmarkItemType
 import com.example.data.model.BrowserHistoryItem
@@ -142,6 +143,9 @@ class XProRepository(private val dao: XProDao) {
     fun observePostsByAuthor(authorId: String): Flow<List<PostItem>> =
         dao.observePostsByAuthor(authorId).map { entities -> entities.map { it.toDomain() } }
 
+    /** Profile used for authorship stamps; falls back to the seeded persona. */
+    suspend fun currentProfile(): UserProfile = dao.getUserProfileOnce()?.toDomain() ?: SeedData.initialProfile
+
     suspend fun getSuggestedUserById(userId: String): SuggestedUser? =
         dao.getSuggestedUserById(userId)?.toDomain()
 
@@ -176,10 +180,19 @@ class XProRepository(private val dao: XProDao) {
         entities.map { it.toDomain() }
     }
 
+    /**
+     * Seeds demo content (fake persona, posts, trends, …) on first launch — debug builds only.
+     * Release installs start with an empty database; every read path must tolerate empty state.
+     * (Unit tests run against the debug variant, so seeded test fixtures still work.)
+     */
     suspend fun ensureSeeded() {
         if (seeded) return
         seedMutex.withLock {
             if (seeded) return
+            if (!BuildConfig.DEBUG) {
+                seeded = true
+                return@withLock
+            }
             if (dao.getPostCount() == 0) {
                 dao.insertUserProfile(SeedData.initialProfile.toEntity())
                 dao.insertFolders(SeedData.initialFolders.map { it.toEntity() })
@@ -348,29 +361,34 @@ class XProRepository(private val dao: XProDao) {
         )
     }
 
-    suspend fun assignBookmark(postId: String, folderId: String?) {
-        val post = dao.getPostById(postId) ?: return
+    suspend fun assignBookmark(postId: String, folderId: String?): TypedBookmarkItem? {
+        val post = dao.getPostById(postId) ?: return null
         dao.updatePost(
             post.copy(
                 isBookmarked = true,
                 bookmarkFolderId = folderId
             )
         )
-        dao.insertTypedBookmark(
-            TypedBookmarkEntity(
-                id = "tb_$postId",
-                itemType = BookmarkItemType.POST.name,
-                title = post.articleTitle ?: "${post.authorName} on X",
-                content = post.content.take(500),
-                authorName = post.authorName,
-                authorHandle = post.authorHandle,
-                mediaUrl = post.mediaUri ?: post.mediaResKey?.let { "drawable://$it" },
-                linkUrl = null,
-                folderId = folderId,
-                postId = post.id,
-                createdAtMillis = System.currentTimeMillis()
-            )
+        val now = System.currentTimeMillis()
+        val existingTb = dao.getTypedBookmarkById("tb_$postId")
+        val item = TypedBookmarkItem(
+            id = "tb_$postId",
+            itemType = BookmarkItemType.POST,
+            title = post.articleTitle ?: "${post.authorName} on X",
+            content = post.content.take(500),
+            authorName = post.authorName,
+            authorHandle = post.authorHandle,
+            mediaUrl = post.mediaUri ?: post.mediaResKey?.let { "drawable://$it" },
+            linkUrl = null,
+            folderId = folderId,
+            postId = post.id,
+            createdAtMillis = existingTb?.createdAtMillis ?: now,
+            updatedAtMillis = now
         )
+        dao.insertTypedBookmark(item.toEntity().copy(pendingSync = true))
+        // Re-bookmarking something previously deleted locally clears the tombstone so it can sync again.
+        dao.clearPendingRemoteDelete(item.id)
+        return item
     }
 
     suspend fun removeBookmark(postId: String) {
@@ -382,6 +400,10 @@ class XProRepository(private val dao: XProDao) {
             )
         )
         dao.deleteTypedBookmarkByPostId(postId)
+        // Tombstone so the next sync deletes the remote doc instead of resurrecting it locally.
+        dao.insertPendingRemoteDelete(
+            PendingRemoteDeleteEntity("tb_$postId", PendingRemoteDeleteKind.BOOKMARK, System.currentTimeMillis())
+        )
     }
 
     suspend fun addTypedBookmark(
@@ -395,6 +417,7 @@ class XProRepository(private val dao: XProDao) {
         folderId: String? = null,
         customId: String? = null
     ): TypedBookmarkItem {
+        val now = System.currentTimeMillis()
         val item = TypedBookmarkItem(
             id = customId ?: "tb_${UUID.randomUUID().toString().replace("-", "_").take(16)}",
             itemType = itemType,
@@ -406,28 +429,74 @@ class XProRepository(private val dao: XProDao) {
             linkUrl = linkUrl?.takeIf { it.isNotBlank() },
             folderId = folderId,
             postId = null,
-            createdAtMillis = System.currentTimeMillis()
+            createdAtMillis = now,
+            updatedAtMillis = now
         )
-        dao.insertTypedBookmark(item.toEntity())
+        dao.insertTypedBookmark(item.toEntity().copy(pendingSync = true))
+        dao.clearPendingRemoteDelete(item.id)
         return item
     }
 
     suspend fun mergeRemoteBookmarks(remoteItems: List<TypedBookmarkItem>) {
-        if (remoteItems.isEmpty()) return
-        dao.insertTypedBookmarks(remoteItems.map { it.toEntity() })
+        if (remoteItems.isEmpty()) {
+            // Authoritative empty snapshot: drop synced local rows that no longer exist remotely.
+            dao.deleteAllSyncedTypedBookmarks()
+            return
+        }
+        for (item in remoteItems) {
+            // Never resurrect an item we deleted locally and haven't replayed remotely yet.
+            if (dao.isPendingRemoteDelete(item.id, PendingRemoteDeleteKind.BOOKMARK)) continue
+            val existing = dao.getTypedBookmarkById(item.id)
+            if (existing?.pendingSync == true) continue // local unsynced edits win; pushed on next sync
+            val effectiveUpdated = if (item.updatedAtMillis > 0L) item.updatedAtMillis else item.createdAtMillis
+            dao.insertTypedBookmark(item.toEntity().copy(updatedAtMillis = effectiveUpdated, pendingSync = false))
+        }
+        dao.deleteSyncedTypedBookmarksNotIn(remoteItems.map { it.id })
     }
 
+    suspend fun getPendingSyncBookmarks(): List<TypedBookmarkItem> =
+        dao.getPendingSyncTypedBookmarks().map { it.toDomain() }
+
+    suspend fun markBookmarksSynced(ids: List<String>) {
+        if (ids.isNotEmpty()) dao.clearPendingTypedBookmarks(ids)
+    }
+
+    suspend fun getPendingRemoteDeletes(): List<PendingRemoteDeleteEntity> = dao.getPendingRemoteDeletes()
+
+    suspend fun clearPendingRemoteDelete(id: String) = dao.clearPendingRemoteDelete(id)
+
     suspend fun mergeRemoteFolders(remoteFolders: List<BookmarkFolder>) {
-        if (remoteFolders.isEmpty()) return
-        dao.insertFolders(remoteFolders.map { it.toEntity() })
+        if (remoteFolders.isEmpty()) {
+            dao.deleteAllSyncedFolders()
+            return
+        }
+        val now = System.currentTimeMillis()
+        for (folder in remoteFolders) {
+            if (dao.isPendingRemoteDelete(folder.id, PendingRemoteDeleteKind.FOLDER)) continue
+            val existing = dao.getBookmarkFolderById(folder.id)
+            if (existing?.pendingSync == true) continue
+            dao.insertFolder(folder.toEntity().copy(updatedAtMillis = now, pendingSync = false))
+        }
+        dao.deleteSyncedFoldersNotIn(remoteFolders.map { it.id })
+    }
+
+    suspend fun getPendingSyncFolders(): List<BookmarkFolder> =
+        dao.getPendingSyncFolders().map { it.toDomain() }
+
+    suspend fun markFoldersSynced(ids: List<String>) {
+        if (ids.isNotEmpty()) dao.clearPendingFolders(ids)
     }
 
     suspend fun assignTypedBookmarkFolder(bookmarkId: String, folderId: String?) {
         dao.updateTypedBookmarkFolder(bookmarkId, folderId)
+        dao.markTypedBookmarkPendingSync(bookmarkId, System.currentTimeMillis())
     }
 
     suspend fun deleteTypedBookmark(bookmarkId: String, linkedPostId: String?) {
         dao.deleteTypedBookmarkById(bookmarkId)
+        dao.insertPendingRemoteDelete(
+            PendingRemoteDeleteEntity(bookmarkId, PendingRemoteDeleteKind.BOOKMARK, System.currentTimeMillis())
+        )
         if (linkedPostId != null) {
             dao.getPostById(linkedPostId)?.let { post ->
                 dao.updatePost(post.copy(isBookmarked = false, bookmarkFolderId = null))
@@ -443,7 +512,9 @@ class XProRepository(private val dao: XProDao) {
                 name = name.trim(),
                 description = description.trim(),
                 colorHex = colorHex,
-                iconKey = iconKey
+                iconKey = iconKey,
+                updatedAtMillis = System.currentTimeMillis(),
+                pendingSync = true
             )
         )
         return id
@@ -451,8 +522,11 @@ class XProRepository(private val dao: XProDao) {
 
     suspend fun deleteBookmarkFolder(folderId: String) {
         dao.clearFolderFromPosts(folderId)
-        dao.clearFolderFromTypedBookmarks(folderId)
+        dao.clearFolderFromTypedBookmarks(folderId, System.currentTimeMillis())
         dao.deleteFolderById(folderId)
+        dao.insertPendingRemoteDelete(
+            PendingRemoteDeleteEntity(folderId, PendingRemoteDeleteKind.FOLDER, System.currentTimeMillis())
+        )
     }
 
     suspend fun updateUserProfile(
@@ -467,10 +541,11 @@ class XProRepository(private val dao: XProDao) {
         autoExpandThreads: Boolean
     ) {
         val current = dao.getUserProfileOnce()?.toDomain() ?: SeedData.initialProfile
-        val normalizedHandle = if (handle.trim().startsWith("@")) handle.trim() else "@${handle.trim()}"
+        val trimmedHandle = handle.trim().removePrefix("@")
+        val normalizedHandle = if (trimmedHandle.isEmpty()) current.handle else "@$trimmedHandle"
         val updated = current.copy(
             name = name.trim().ifEmpty { current.name },
-            handle = normalizedHandle.ifEmpty { current.handle },
+            handle = normalizedHandle,
             bio = bio.trim(),
             badge = badge,
             undoDelaySeconds = undoDelaySeconds,
@@ -663,6 +738,8 @@ class XProRepository(private val dao: XProDao) {
     }
 
     suspend fun deletePlaylist(playlistId: String) {
+        // Media items keep a dangling playlistId otherwise; detach them first.
+        dao.clearPlaylistFromMedia(playlistId)
         dao.deletePlaylistById(playlistId)
     }
 

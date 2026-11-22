@@ -17,8 +17,11 @@ import com.example.data.model.ProfileTab
 import com.example.data.model.ReaderTypography
 import com.example.data.model.SuggestedUser
 import com.example.data.model.TrendItem
+import com.example.data.model.TypedBookmarkItem
 import com.example.data.model.UserProfile
 import com.example.data.model.VerificationBadge
+import com.example.data.remote.FirestoreBookmarkSyncRepository
+import com.example.data.remote.SyncWriteResult
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -139,6 +142,60 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
     private val repository: XProRepository
     private val controls = MutableStateFlow(UiControlState())
     private var undoTimerJob: Job? = null
+
+    // Cloud-sync write-through: repository writes stay Room-local; this layer mirrors them to Firestore.
+    private val firestoreSync by lazy { FirestoreBookmarkSyncRepository(application) }
+    @Volatile private var cloudUid: String? = null
+
+    /** Called by MainActivity whenever the signed-in Firebase uid changes (null = guest). */
+    fun setCloudSyncUid(uid: String?) {
+        cloudUid = uid
+    }
+
+    private fun pushBookmarkUpsert(item: TypedBookmarkItem) {
+        val uid = cloudUid ?: return
+        viewModelScope.launch {
+            when (firestoreSync.upsertBookmark(
+                uid = uid,
+                bookmarkId = item.id,
+                title = item.title,
+                content = item.content,
+                authorName = item.authorName,
+                authorHandle = item.authorHandle,
+                itemType = item.itemType.name,
+                mediaUrl = item.mediaUrl,
+                linkUrl = item.linkUrl,
+                folderId = item.folderId
+            )) {
+                SyncWriteResult.Synced -> repository.markBookmarksSynced(listOf(item.id))
+                else -> Unit // stays pendingSync; retried on next sign-in/sync
+            }
+        }
+    }
+
+    private suspend fun pushBookmarkDelete(bookmarkId: String) {
+        val uid = cloudUid ?: return
+        when (firestoreSync.deleteBookmark(uid, bookmarkId)) {
+            SyncWriteResult.Synced -> repository.clearPendingRemoteDelete(bookmarkId)
+            else -> Unit // tombstone kept; replayed on next sign-in/sync
+        }
+    }
+
+    private suspend fun pushFolderUpsert(id: String, name: String, description: String, colorHex: Long, iconKey: String) {
+        val uid = cloudUid ?: return
+        when (firestoreSync.upsertFolder(uid, id, name.trim(), description.trim(), colorHex, iconKey)) {
+            SyncWriteResult.Synced -> repository.markFoldersSynced(listOf(id))
+            else -> Unit
+        }
+    }
+
+    private suspend fun pushFolderDelete(id: String) {
+        val uid = cloudUid ?: return
+        when (firestoreSync.deleteFolder(uid, id)) {
+            SyncWriteResult.Synced -> repository.clearPendingRemoteDelete(id)
+            else -> Unit
+        }
+    }
 
     init {
         repository = XProRepository.getInstance(application)
@@ -431,18 +488,19 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
         controls.update { it.copy(pendingPost = pending) }
 
         undoTimerJob?.cancel()
+        val deadlineMillis = System.currentTimeMillis() + totalMs
         undoTimerJob = viewModelScope.launch {
-            var remaining = totalMs
-            val stepMs = 50L
-            while (remaining > 0L) {
-                delay(stepMs)
-                remaining = (remaining - stepMs).coerceAtLeast(0L)
+            val stepMs = 100L
+            while (true) {
+                val remaining = (deadlineMillis - System.currentTimeMillis()).coerceAtLeast(0L)
                 controls.update { state ->
                     val current = state.pendingPost
                     if (current?.id == pending.id) {
                         state.copy(pendingPost = current.copy(remainingMillis = remaining))
                     } else state
                 }
+                if (remaining <= 0L) break
+                delay(stepMs)
             }
             val finalPending = controls.value.pendingPost
             if (finalPending?.id == pending.id) {
@@ -584,7 +642,8 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveBookmarkToFolder(postId: String, folderId: String?) {
         viewModelScope.launch {
-            repository.assignBookmark(postId, folderId)
+            val item = repository.assignBookmark(postId, folderId)
+            if (item != null) pushBookmarkUpsert(item)
             controls.update { it.copy(bookmarkTargetPost = null) }
             showToast("Saved to bookmarks")
         }
@@ -593,6 +652,7 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
     fun removeBookmark(postId: String) {
         viewModelScope.launch {
             repository.removeBookmark(postId)
+            pushBookmarkDelete("tb_$postId")
             controls.update { it.copy(bookmarkTargetPost = null) }
             showToast("Removed from bookmarks")
         }
@@ -610,9 +670,11 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
         if (name.isBlank()) return
         viewModelScope.launch {
             val newId = repository.createBookmarkFolder(name, description, colorHex, iconKey)
+            pushFolderUpsert(newId, name, description, colorHex, iconKey)
             val targetPost = controls.value.bookmarkTargetPost
             if (targetPost != null) {
-                repository.assignBookmark(targetPost.id, newId)
+                val item = repository.assignBookmark(targetPost.id, newId)
+                if (item != null) pushBookmarkUpsert(item)
             }
             controls.update {
                 it.copy(
@@ -627,6 +689,7 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteBookmarkFolder(folderId: String) {
         viewModelScope.launch {
             repository.deleteBookmarkFolder(folderId)
+            pushFolderDelete(folderId)
             if (controls.value.selectedFolderId == folderId) {
                 controls.update { it.copy(selectedFolderId = null) }
             }

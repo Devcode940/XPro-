@@ -1,5 +1,6 @@
 package com.example.data.local
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import com.example.data.model.BookmarkFolder
@@ -66,13 +67,30 @@ data class PostEntity(
     val offlineNotes: String? = null
 )
 
+/** Tombstone for items deleted locally while offline: replayed remotely on the next sync. */
+@Entity(tableName = "pending_remote_deletes")
+data class PendingRemoteDeleteEntity(
+    @PrimaryKey val id: String,
+    /** "bookmark" or "folder", see [PendingRemoteDeleteKind]. */
+    val kind: String,
+    val createdAtMillis: Long
+)
+
+object PendingRemoteDeleteKind {
+    const val BOOKMARK = "bookmark"
+    const val FOLDER = "folder"
+}
+
 @Entity(tableName = "bookmark_folders")
 data class BookmarkFolderEntity(
     @PrimaryKey val id: String,
     val name: String,
     val description: String,
     val colorHex: Long,
-    val iconKey: String
+    val iconKey: String,
+    @ColumnInfo(defaultValue = "0") val updatedAtMillis: Long = 0L,
+    /** true when this row has local changes not yet pushed to Firestore. */
+    @ColumnInfo(defaultValue = "0") val pendingSync: Boolean = false
 )
 
 @Entity(tableName = "bookmarks_vault")
@@ -87,7 +105,10 @@ data class TypedBookmarkEntity(
     val linkUrl: String?,
     val folderId: String?,
     val postId: String?,
-    val createdAtMillis: Long
+    val createdAtMillis: Long,
+    @ColumnInfo(defaultValue = "0") val updatedAtMillis: Long = 0L,
+    /** true when this row has local changes not yet pushed to Firestore. */
+    @ColumnInfo(defaultValue = "0") val pendingSync: Boolean = false
 )
 
 @Entity(tableName = "user_profile")
@@ -343,7 +364,8 @@ fun TypedBookmarkEntity.toDomain() = TypedBookmarkItem(
     linkUrl = linkUrl,
     folderId = folderId,
     postId = postId,
-    createdAtMillis = createdAtMillis
+    createdAtMillis = createdAtMillis,
+    updatedAtMillis = updatedAtMillis
 )
 
 fun TypedBookmarkItem.toEntity() = TypedBookmarkEntity(
@@ -357,7 +379,9 @@ fun TypedBookmarkItem.toEntity() = TypedBookmarkEntity(
     linkUrl = linkUrl,
     folderId = folderId,
     postId = postId,
-    createdAtMillis = createdAtMillis
+    createdAtMillis = createdAtMillis,
+    updatedAtMillis = updatedAtMillis,
+    pendingSync = false
 )
 
 fun UserProfileEntity.toDomain() = UserProfile(

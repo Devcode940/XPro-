@@ -8,10 +8,9 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.IgnoreExtraProperties
-import com.google.firebase.firestore.ServerTimestamp
-import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -32,8 +31,8 @@ data class SyncedBookmarkDoc(
     val mediaUrl: String? = null,
     val linkUrl: String? = null,
     val folderId: String? = null,
-    @ServerTimestamp val createdAt: Timestamp? = null,
-    @ServerTimestamp val updatedAt: Timestamp? = null
+    @com.google.firebase.firestore.ServerTimestamp val createdAt: Timestamp? = null,
+    @com.google.firebase.firestore.ServerTimestamp val updatedAt: Timestamp? = null
 )
 
 @Keep
@@ -46,14 +45,26 @@ data class SyncedBookmarkFolderDoc(
     val description: String = "",
     val colorHex: Long = 0xFF1D9BF0L,
     val iconKey: String = "folder",
-    @ServerTimestamp val createdAt: Timestamp? = null,
-    @ServerTimestamp val updatedAt: Timestamp? = null
+    @com.google.firebase.firestore.ServerTimestamp val createdAt: Timestamp? = null,
+    @com.google.firebase.firestore.ServerTimestamp val updatedAt: Timestamp? = null
 )
 
 sealed interface FirestoreSyncResult<out T> {
     data object Loading : FirestoreSyncResult<Nothing>
     data class Success<T>(val data: T) : FirestoreSyncResult<T>
     data class Error(val message: String, val cause: Throwable) : FirestoreSyncResult<Nothing>
+}
+
+/** Outcome of a one-shot write; lets the UI distinguish "cloud synced" from "local only". */
+sealed interface SyncWriteResult {
+    /** Written to Firestore. */
+    data object Synced : SyncWriteResult
+
+    /** Firebase is unavailable or the caller isn't authenticated as this uid; nothing was written remotely. */
+    data object GuestMode : SyncWriteResult
+
+    /** Write was attempted and rejected/failed. */
+    data class Failed(val message: String, val cause: Throwable?) : SyncWriteResult
 }
 
 class FirestoreBookmarkSyncRepository(private val context: Context) {
@@ -93,16 +104,13 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
             val registration = db.collection(path)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
-                        runCatching {
-                            handleFirestoreError(error, FirestoreOperationType.LIST, path)
-                        }.onFailure { wrapped ->
-                            trySend(
-                                FirestoreSyncResult.Error(
-                                    error.localizedMessage ?: "Failed to sync cloud bookmarks",
-                                    wrapped
-                                )
+                        logFirestoreError(error, FirestoreOperationType.LIST, path)
+                        trySend(
+                            FirestoreSyncResult.Error(
+                                sanitizedFirestoreMessage(error, "Failed to sync cloud bookmarks"),
+                                error
                             )
-                        }
+                        )
                         return@addSnapshotListener
                     }
                     val docs = snapshot?.documents?.mapNotNull { doc ->
@@ -128,16 +136,13 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
             val registration = db.collection(path)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
-                        runCatching {
-                            handleFirestoreError(error, FirestoreOperationType.LIST, path)
-                        }.onFailure { wrapped ->
-                            trySend(
-                                FirestoreSyncResult.Error(
-                                    error.localizedMessage ?: "Failed to sync bookmark folders",
-                                    wrapped
-                                )
+                        logFirestoreError(error, FirestoreOperationType.LIST, path)
+                        trySend(
+                            FirestoreSyncResult.Error(
+                                sanitizedFirestoreMessage(error, "Failed to sync bookmark folders"),
+                                error
                             )
-                        }
+                        )
                         return@addSnapshotListener
                     }
                     val docs = snapshot?.documents?.mapNotNull { doc ->
@@ -163,69 +168,70 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
         mediaUrl: String?,
         linkUrl: String?,
         folderId: String?
-    ): Result<Unit> {
+    ): SyncWriteResult {
         if (uid.isBlank() || authenticatedUidOrNull() != uid) {
-            return Result.success(Unit)
+            return SyncWriteResult.GuestMode
         }
-        val db = firestoreOrNull() ?: return Result.success(Unit)
+        val db = firestoreOrNull() ?: return SyncWriteResult.GuestMode
         val sanitizedId = sanitizeId(bookmarkId)
         val path = "users/$uid/bookmarks/$sanitizedId"
         val validItemType = itemType.uppercase().takeIf { it in setOf("POST", "VIDEO", "IMAGE", "LINK") } ?: "POST"
         val sanitizedFolderId = folderId?.takeIf { it.isNotBlank() && safeIdRegex.matches(it) && it.length <= 128 }
-        val nowTs = Timestamp.now()
+        val cleanContent = content.ifBlank { title.ifBlank { "Saved bookmark" } }.take(5000)
 
         return try {
             val docRef = db.collection("users").document(uid).collection("bookmarks").document(sanitizedId)
             val existing = docRef.get().await()
             if (existing.exists()) {
-                val updates = mutableMapOf<String, Any?>(
+                val updates = mutableMapOf<String, Any>(
                     "title" to title.take(300),
-                    "content" to content.ifBlank { title.ifBlank { "Saved bookmark" } }.take(5000),
+                    "content" to cleanContent,
                     "itemType" to validItemType,
-                    "mediaUrl" to mediaUrl?.take(1000),
-                    "linkUrl" to linkUrl?.take(1000),
-                    "folderId" to sanitizedFolderId,
-                    "updatedAt" to nowTs
-                ).filterValues { it != null }
-                docRef.set(updates, SetOptions.merge()).await()
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+                // Null means "cleared locally": delete the remote key so it can't linger.
+                updates["mediaUrl"] = mediaUrl?.take(1000) ?: FieldValue.delete()
+                updates["linkUrl"] = linkUrl?.take(1000) ?: FieldValue.delete()
+                updates["folderId"] = sanitizedFolderId ?: FieldValue.delete()
+                docRef.update(updates).await()
             } else {
-                val createMap = mutableMapOf<String, Any?>(
+                val createMap = mutableMapOf<String, Any>(
                     "userId" to uid,
                     "title" to title.take(300),
-                    "content" to content.ifBlank { title.ifBlank { "Saved bookmark" } }.take(5000),
+                    "content" to cleanContent,
                     "authorName" to authorName.ifBlank { "XTRA User" }.take(120),
                     "authorHandle" to authorHandle.ifBlank { "@user" }.take(80),
                     "itemType" to validItemType,
-                    "mediaUrl" to mediaUrl?.take(1000),
-                    "linkUrl" to linkUrl?.take(1000),
-                    "folderId" to sanitizedFolderId,
-                    "createdAt" to nowTs,
-                    "updatedAt" to nowTs
-                ).filterValues { it != null }
+                    "createdAt" to FieldValue.serverTimestamp(),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+                mediaUrl?.take(1000)?.let { createMap["mediaUrl"] = it }
+                linkUrl?.take(1000)?.let { createMap["linkUrl"] = it }
+                sanitizedFolderId?.let { createMap["folderId"] = it }
                 docRef.set(createMap).await()
             }
-            Result.success(Unit)
+            SyncWriteResult.Synced
         } catch (e: Exception) {
-            runCatching { handleFirestoreError(e, FirestoreOperationType.WRITE, path) }
-            Result.failure(e)
+            logFirestoreError(e, FirestoreOperationType.WRITE, path)
+            SyncWriteResult.Failed(sanitizedFirestoreMessage(e, "Bookmark sync failed"), e)
         }
     }
 
-    suspend fun deleteBookmark(uid: String, bookmarkId: String): Result<Unit> {
+    suspend fun deleteBookmark(uid: String, bookmarkId: String): SyncWriteResult {
         if (uid.isBlank() || authenticatedUidOrNull() != uid) {
-            return Result.success(Unit)
+            return SyncWriteResult.GuestMode
         }
-        val db = firestoreOrNull() ?: return Result.success(Unit)
+        val db = firestoreOrNull() ?: return SyncWriteResult.GuestMode
         val sanitizedId = sanitizeId(bookmarkId)
         val path = "users/$uid/bookmarks/$sanitizedId"
         return try {
             db.collection("users").document(uid).collection("bookmarks").document(sanitizedId)
                 .delete()
                 .await()
-            Result.success(Unit)
+            SyncWriteResult.Synced
         } catch (e: Exception) {
-            runCatching { handleFirestoreError(e, FirestoreOperationType.DELETE, path) }
-            Result.failure(e)
+            logFirestoreError(e, FirestoreOperationType.DELETE, path)
+            SyncWriteResult.Failed(sanitizedFirestoreMessage(e, "Bookmark delete sync failed"), e)
         }
     }
 
@@ -236,61 +242,62 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
         description: String,
         colorHex: Long,
         iconKey: String
-    ): Result<Unit> {
+    ): SyncWriteResult {
         if (uid.isBlank() || authenticatedUidOrNull() != uid) {
-            return Result.success(Unit)
+            return SyncWriteResult.GuestMode
         }
-        val db = firestoreOrNull() ?: return Result.success(Unit)
+        val db = firestoreOrNull() ?: return SyncWriteResult.GuestMode
         val sanitizedId = sanitizeId(folderId)
         val path = "users/$uid/bookmark_folders/$sanitizedId"
-        val nowTs = Timestamp.now()
 
         return try {
             val docRef = db.collection("users").document(uid).collection("bookmark_folders").document(sanitizedId)
             val existing = docRef.get().await()
             if (existing.exists()) {
-                val updates = mapOf(
-                    "name" to name.ifBlank { "Collection" }.take(60),
-                    "description" to description.take(200),
-                    "colorHex" to colorHex,
-                    "iconKey" to iconKey.ifBlank { "folder" }.take(40),
-                    "updatedAt" to nowTs
-                )
-                docRef.set(updates, SetOptions.merge()).await()
+                docRef.update(
+                    mapOf(
+                        "name" to name.ifBlank { "Collection" }.take(60),
+                        "description" to description.take(200),
+                        "colorHex" to colorHex,
+                        "iconKey" to iconKey.ifBlank { "folder" }.take(40),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
             } else {
-                val createMap = mapOf(
-                    "userId" to uid,
-                    "name" to name.ifBlank { "Collection" }.take(60),
-                    "description" to description.take(200),
-                    "colorHex" to colorHex,
-                    "iconKey" to iconKey.ifBlank { "folder" }.take(40),
-                    "createdAt" to nowTs,
-                    "updatedAt" to nowTs
-                )
-                docRef.set(createMap).await()
+                docRef.set(
+                    mapOf(
+                        "userId" to uid,
+                        "name" to name.ifBlank { "Collection" }.take(60),
+                        "description" to description.take(200),
+                        "colorHex" to colorHex,
+                        "iconKey" to iconKey.ifBlank { "folder" }.take(40),
+                        "createdAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
             }
-            Result.success(Unit)
+            SyncWriteResult.Synced
         } catch (e: Exception) {
-            runCatching { handleFirestoreError(e, FirestoreOperationType.WRITE, path) }
-            Result.failure(e)
+            logFirestoreError(e, FirestoreOperationType.WRITE, path)
+            SyncWriteResult.Failed(sanitizedFirestoreMessage(e, "Folder sync failed"), e)
         }
     }
 
-    suspend fun deleteFolder(uid: String, folderId: String): Result<Unit> {
+    suspend fun deleteFolder(uid: String, folderId: String): SyncWriteResult {
         if (uid.isBlank() || authenticatedUidOrNull() != uid) {
-            return Result.success(Unit)
+            return SyncWriteResult.GuestMode
         }
-        val db = firestoreOrNull() ?: return Result.success(Unit)
+        val db = firestoreOrNull() ?: return SyncWriteResult.GuestMode
         val sanitizedId = sanitizeId(folderId)
         val path = "users/$uid/bookmark_folders/$sanitizedId"
         return try {
             db.collection("users").document(uid).collection("bookmark_folders").document(sanitizedId)
                 .delete()
                 .await()
-            Result.success(Unit)
+            SyncWriteResult.Synced
         } catch (e: Exception) {
-            runCatching { handleFirestoreError(e, FirestoreOperationType.DELETE, path) }
-            Result.failure(e)
+            logFirestoreError(e, FirestoreOperationType.DELETE, path)
+            SyncWriteResult.Failed(sanitizedFirestoreMessage(e, "Folder delete sync failed"), e)
         }
     }
 

@@ -446,6 +446,7 @@ private fun DownloadQueueRow(
         DownloadStatus.FAILED -> colorScheme.error
         DownloadStatus.PAUSED -> colorScheme.secondary
         DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED -> colorScheme.primary
+        DownloadStatus.CANCELLED -> colorScheme.onSurfaceVariant
     }
     Surface(
         color = colorScheme.surfaceContainer,

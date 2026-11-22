@@ -148,7 +148,9 @@ data class TypedBookmarkItem(
     val linkUrl: String? = null,
     val folderId: String? = null,
     val postId: String? = null,
-    val createdAtMillis: Long
+    val createdAtMillis: Long,
+    /** Last modification time. 0 = unknown/legacy (treated as createdAt for merge decisions). */
+    val updatedAtMillis: Long = 0L
 )
 
 data class TrendItem(

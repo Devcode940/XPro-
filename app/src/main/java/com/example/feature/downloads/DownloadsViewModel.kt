@@ -101,7 +101,8 @@ class DownloadsViewModel(application: Application) : AndroidViewModel(applicatio
                 it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.PAUSED
             }
             DownloadsFilterTab.COMPLETED -> all.filter { it.status == DownloadStatus.SUCCEEDED }
-            DownloadsFilterTab.FAILED -> all.filter { it.status == DownloadStatus.FAILED }
+            // Cancelled downloads are grouped with failures so they don't silently disappear from every tab.
+            DownloadsFilterTab.FAILED -> all.filter { it.status == DownloadStatus.FAILED || it.status == DownloadStatus.CANCELLED }
         }
 
         DownloadsUiState(
@@ -152,7 +153,7 @@ class DownloadsViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun pauseDownload(downloadId: Long) {
         downloader.pauseDownload(downloadId)
-        banner.value = "Download paused" to false
+        banner.value = "Paused — resuming re-downloads from the start" to false
     }
 
     fun resumeDownload(downloadId: Long) {
@@ -176,7 +177,7 @@ class DownloadsViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteDownload(downloadId: Long) {
         downloader.deleteDownload(downloadId, deleteLocalFile = false)
-        banner.value = "Download removed" to false
+        banner.value = "Download removed from the list" to false
     }
 
     fun refreshAll() {

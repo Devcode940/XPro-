@@ -1,21 +1,37 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# XPro release rules (R8). Keep tuned to libraries bundled in the app.
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Keep line numbers for crash stack traces; hide original file names.
+-keepattributes SourceFile,LineNumberTable,AnnotationDefault,EnclosingMethod,Signature,InnerClasses
+-renamesourcefileattribute SourceFile
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# --- Firebase / Firestore ---
+# DTOs are mapped by the Firestore SDK via reflection.
+-keep class com.example.data.remote.** { *; }
+-keepclassmembers class * {
+    @com.google.firebase.firestore.ServerTimestamp <fields>;
+    @com.google.firebase.firestore.DocumentId <fields>;
+}
+-keep class com.google.firebase.** { *; }
+-dontwarn com.google.firebase.**
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# --- Parcelable / Room ---
+-keep class * implements android.os.Parcelable { *; }
+-keepclassmembers class * extends androidx.room.RoomDatabase { *; }
+
+# --- kotlinx.coroutines / Kotlin metadata ---
+-keepclassmembernames class kotlinx.** { volatile <fields>; }
+-dontwarn kotlinx.coroutines.**
+
+# --- Credential Manager / Google Sign-In ---
+-keep class androidx.credentials.** { *; }
+-keep class com.google.android.libraries.identity.** { *; }
+-dontwarn androidx.credentials.**
+
+# --- Compose ---
+-dontwarn androidx.compose.**
+
+# --- App models (domain DTO-ish classes used via reflection/serialization) ---
+-keep class com.example.data.model.** { *; }
+-keep class com.example.feature.** { *; }
+-keep class com.example.viewmodel.** { *; }
+-keep class com.devcode.xpro.mediadownloader.** { *; }

@@ -8,8 +8,10 @@ import com.example.data.model.BookmarkFolder
 import com.example.data.model.BookmarkItemType
 import com.example.data.model.PostItem
 import com.example.data.model.TypedBookmarkItem
+import com.example.data.local.PendingRemoteDeleteKind
 import com.example.data.remote.FirestoreBookmarkSyncRepository
 import com.example.data.remote.FirestoreSyncResult
+import com.example.data.remote.SyncWriteResult
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -17,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
@@ -66,6 +69,15 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
 
         // Only attach Firestore listeners when authenticated (uid != null).
         // Guest mode remains strictly Room-local with zero Firestore network calls.
+        // First: replay offline deletes, then push locally-pending writes made while signed out/offline.
+        viewModelScope.launch {
+            activeUid.collectLatest { uid ->
+                if (!uid.isNullOrBlank()) {
+                    pushPendingSync(uid)
+                }
+            }
+        }
+
         activeUid.flatMapLatest { uid ->
             if (uid.isNullOrBlank()) {
                 syncStatus.value = false to null
@@ -89,7 +101,7 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                 syncStatus.value = false to err
             }
 
-            if (foldersRes is FirestoreSyncResult.Success && foldersRes.data.isNotEmpty()) {
+            if (foldersRes is FirestoreSyncResult.Success) {
                 val domainFolders = foldersRes.data.map { doc ->
                     BookmarkFolder(
                         id = doc.id,
@@ -101,8 +113,10 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 localRepo.mergeRemoteFolders(domainFolders)
             }
-            if (bookmarksRes is FirestoreSyncResult.Success && bookmarksRes.data.isNotEmpty()) {
+            if (bookmarksRes is FirestoreSyncResult.Success) {
+                val now = System.currentTimeMillis()
                 val domainBookmarks = bookmarksRes.data.map { doc ->
+                    val created = doc.createdAt?.toDate()?.time ?: now
                     TypedBookmarkItem(
                         id = doc.id,
                         itemType = runCatching { BookmarkItemType.valueOf(doc.itemType) }.getOrDefault(BookmarkItemType.POST),
@@ -114,12 +128,55 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                         linkUrl = doc.linkUrl,
                         folderId = doc.folderId,
                         postId = null,
-                        createdAtMillis = doc.createdAt?.toDate()?.time ?: System.currentTimeMillis()
+                        createdAtMillis = created,
+                        updatedAtMillis = doc.updatedAt?.toDate()?.time ?: created
                     )
                 }
                 localRepo.mergeRemoteBookmarks(domainBookmarks)
             }
         }.launchIn(viewModelScope)
+    }
+
+    /** Replays tombstoned deletes and pushes locally-pending writes; returns nothing but sets a banner on failure. */
+    private suspend fun pushPendingSync(uid: String) {
+        localRepo.getPendingRemoteDeletes().forEach { tombstone ->
+            val res = when (tombstone.kind) {
+                PendingRemoteDeleteKind.BOOKMARK -> firestoreRepo.deleteBookmark(uid, tombstone.id)
+                PendingRemoteDeleteKind.FOLDER -> firestoreRepo.deleteFolder(uid, tombstone.id)
+                else -> SyncWriteResult.GuestMode
+            }
+            if (res is SyncWriteResult.Synced) {
+                localRepo.clearPendingRemoteDelete(tombstone.id)
+            }
+        }
+
+        var failures = 0
+        localRepo.getPendingSyncFolders().forEach { folder ->
+            when (firestoreRepo.upsertFolder(uid, folder.id, folder.name, folder.description, folder.colorHex, folder.iconKey)) {
+                SyncWriteResult.Synced -> localRepo.markFoldersSynced(listOf(folder.id))
+                else -> failures++
+            }
+        }
+        localRepo.getPendingSyncBookmarks().forEach { item ->
+            when (firestoreRepo.upsertBookmark(
+                uid = uid,
+                bookmarkId = item.id,
+                title = item.title,
+                content = item.content,
+                authorName = item.authorName,
+                authorHandle = item.authorHandle,
+                itemType = item.itemType.name,
+                mediaUrl = item.mediaUrl,
+                linkUrl = item.linkUrl,
+                folderId = item.folderId
+            )) {
+                SyncWriteResult.Synced -> localRepo.markBookmarksSynced(listOf(item.id))
+                else -> failures++
+            }
+        }
+        if (failures > 0) {
+            bannerState.value = "$failures change(s) couldn't be synced — kept on device, will retry on next sync"
+        }
     }
 
     val uiState: StateFlow<BookmarksUiState> = combine(
@@ -221,8 +278,16 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         if (name.isBlank()) return
         viewModelScope.launch {
             val id = localRepo.createBookmarkFolder(name, description, colorHex, "folder")
-            activeUid.value?.let { uid ->
-                firestoreRepo.upsertFolder(uid, id, name.trim(), description.trim(), colorHex, "folder")
+            val uid = activeUid.value
+            if (uid != null) {
+                when (val res = firestoreRepo.upsertFolder(uid, id, name.trim(), description.trim(), colorHex, "folder")) {
+                    SyncWriteResult.Synced -> localRepo.markFoldersSynced(listOf(id))
+                    is SyncWriteResult.Failed -> {
+                        bannerState.value = "Collection saved on this device — sync failed: ${res.message}"
+                        return@launch
+                    }
+                    SyncWriteResult.GuestMode -> Unit
+                }
             }
             bannerState.value = "Created collection \"$name\""
         }
@@ -237,18 +302,20 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         folderId: String?
     ) {
         viewModelScope.launch {
+            val profile = localRepo.currentProfile()
             val created = localRepo.addTypedBookmark(
                 itemType = itemType,
                 title = title,
                 content = content,
-                authorName = "Elena Vance",
-                authorHandle = "@elenavance",
+                authorName = profile.name,
+                authorHandle = profile.handle,
                 mediaUrl = mediaUrl,
                 linkUrl = linkUrl,
                 folderId = folderId
             )
-            activeUid.value?.let { uid ->
-                firestoreRepo.upsertBookmark(
+            val uid = activeUid.value
+            if (uid != null) {
+                when (val res = firestoreRepo.upsertBookmark(
                     uid = uid,
                     bookmarkId = created.id,
                     title = created.title,
@@ -259,7 +326,14 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                     mediaUrl = created.mediaUrl,
                     linkUrl = created.linkUrl,
                     folderId = created.folderId
-                )
+                )) {
+                    SyncWriteResult.Synced -> localRepo.markBookmarksSynced(listOf(created.id))
+                    is SyncWriteResult.Failed -> {
+                        bannerState.value = "Saved on this device — sync failed: ${res.message}"
+                        return@launch
+                    }
+                    SyncWriteResult.GuestMode -> Unit
+                }
             }
             bannerState.value = "Saved ${itemType.label.lowercase()} bookmark"
         }
@@ -269,8 +343,9 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             localRepo.assignTypedBookmarkFolder(bookmark.id, folderId)
             bookmark.postId?.let { postId -> localRepo.assignBookmark(postId, folderId) }
-            activeUid.value?.let { uid ->
-                firestoreRepo.upsertBookmark(
+            val uid = activeUid.value
+            if (uid != null) {
+                when (val res = firestoreRepo.upsertBookmark(
                     uid = uid,
                     bookmarkId = bookmark.id,
                     title = bookmark.title,
@@ -281,7 +356,14 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                     mediaUrl = bookmark.mediaUrl,
                     linkUrl = bookmark.linkUrl,
                     folderId = folderId
-                )
+                )) {
+                    SyncWriteResult.Synced -> localRepo.markBookmarksSynced(listOf(bookmark.id))
+                    is SyncWriteResult.Failed -> {
+                        bannerState.value = "Moved locally — sync failed: ${res.message}"
+                        return@launch
+                    }
+                    SyncWriteResult.GuestMode -> Unit
+                }
             }
             bannerState.value = "Moved bookmark to collection"
         }
@@ -290,8 +372,13 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
     fun removeTypedBookmark(bookmark: TypedBookmarkItem) {
         viewModelScope.launch {
             localRepo.deleteTypedBookmark(bookmark.id, bookmark.postId)
-            activeUid.value?.let { uid ->
-                firestoreRepo.deleteBookmark(uid, bookmark.id)
+            val uid = activeUid.value
+            if (uid != null) {
+                when (firestoreRepo.deleteBookmark(uid, bookmark.id)) {
+                    SyncWriteResult.Synced -> localRepo.clearPendingRemoteDelete(bookmark.id)
+                    is SyncWriteResult.Failed -> Unit // tombstone kept; replayed on next sync
+                    SyncWriteResult.GuestMode -> Unit
+                }
             }
             bannerState.value = "Bookmark removed"
         }
@@ -303,8 +390,13 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
             if (selectedFolderId.value == folderId) {
                 selectedFolderId.value = null
             }
-            activeUid.value?.let { uid ->
-                firestoreRepo.deleteFolder(uid, folderId)
+            val uid = activeUid.value
+            if (uid != null) {
+                when (firestoreRepo.deleteFolder(uid, folderId)) {
+                    SyncWriteResult.Synced -> localRepo.clearPendingRemoteDelete(folderId)
+                    is SyncWriteResult.Failed -> Unit // tombstone kept; replayed on next sync
+                    SyncWriteResult.GuestMode -> Unit
+                }
             }
             bannerState.value = "Collection deleted"
         }
@@ -319,11 +411,19 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             syncStatus.value = true to null
             val current = uiState.value
+            var synced = 0
+            var failed = 0
             current.folders.forEach { folder ->
-                firestoreRepo.upsertFolder(uid, folder.id, folder.name, folder.description, folder.colorHex, folder.iconKey)
+                when (firestoreRepo.upsertFolder(uid, folder.id, folder.name, folder.description, folder.colorHex, folder.iconKey)) {
+                    SyncWriteResult.Synced -> {
+                        synced++
+                        localRepo.markFoldersSynced(listOf(folder.id))
+                    }
+                    else -> failed++
+                }
             }
             current.typedBookmarks.forEach { item ->
-                firestoreRepo.upsertBookmark(
+                when (firestoreRepo.upsertBookmark(
                     uid = uid,
                     bookmarkId = item.id,
                     title = item.title,
@@ -334,10 +434,20 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                     mediaUrl = item.mediaUrl,
                     linkUrl = item.linkUrl,
                     folderId = item.folderId
-                )
+                )) {
+                    SyncWriteResult.Synced -> {
+                        synced++
+                        localRepo.markBookmarksSynced(listOf(item.id))
+                    }
+                    else -> failed++
+                }
             }
             syncStatus.value = false to null
-            bannerState.value = "Synchronized ${current.typedBookmarks.size} bookmarks & ${current.folders.size} collections with Firestore"
+            bannerState.value = if (failed == 0) {
+                "Synchronized $synced item(s) with Firestore"
+            } else {
+                "Synced $synced item(s); $failed failed — check your connection and try again"
+            }
         }
     }
 

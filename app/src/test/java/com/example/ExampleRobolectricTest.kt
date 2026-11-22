@@ -70,11 +70,11 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `app name matches XPro and applicationId is com Devcode XPro`() {
+    fun `app name matches XPro and applicationId is com devcode xpro`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
         assertEquals("XPro", appName)
-        assertEquals("com.Devcode.XPro", BuildConfig.APPLICATION_ID)
+        assertEquals("com.devcode.xpro", BuildConfig.APPLICATION_ID)
     }
 
     @Test

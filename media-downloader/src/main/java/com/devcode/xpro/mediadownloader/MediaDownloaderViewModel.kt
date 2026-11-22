@@ -114,7 +114,7 @@ class MediaDownloaderViewModel(application: Application) : AndroidViewModel(appl
 
     fun pauseDownload(downloadId: Long) {
         downloader.pauseDownload(downloadId)
-        bannerState.value = "Download paused" to false
+        bannerState.value = "Paused — Android can't truly pause; resuming re-downloads from the start" to false
     }
 
     fun resumeDownload(downloadId: Long, wifiOnly: Boolean = false, showNotifications: Boolean = true) {
@@ -135,8 +135,12 @@ class MediaDownloaderViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun deleteDownload(downloadId: Long, deleteLocalFile: Boolean = false) {
-        downloader.deleteDownload(downloadId, deleteLocalFile)
-        bannerState.value = "Download removed" to false
+        val fileRemoved = downloader.deleteDownload(downloadId, deleteLocalFile)
+        bannerState.value = if (fileRemoved) {
+            "Download removed" to false
+        } else {
+            "Removed from the list, but the file couldn't be deleted from storage" to true
+        }
     }
 
     fun refreshStatus(downloadId: Long) {

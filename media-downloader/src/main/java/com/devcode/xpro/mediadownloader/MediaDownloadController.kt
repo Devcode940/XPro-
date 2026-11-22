@@ -19,9 +19,11 @@ import java.io.File
 enum class DownloadStatus(val label: String) {
     QUEUED("Queued"),
     DOWNLOADING("Downloading"),
+    /** Android DownloadManager cannot pause; a "paused" item is removed and re-downloads from byte 0 on resume. */
     PAUSED("Paused"),
     SUCCEEDED("Completed"),
-    FAILED("Failed")
+    FAILED("Failed"),
+    CANCELLED("Cancelled")
 }
 
 data class MediaDownloadItem(
@@ -176,6 +178,11 @@ class SystemMediaDownloader(private val context: Context) {
         }
     }
 
+    /**
+     * Android's DownloadManager has no pause API. This removes the in-progress download
+     * (its partial file is discarded) and keeps it listed as PAUSED so the user can
+     * re-enqueue it later; resuming re-downloads from byte 0.
+     */
     fun pauseDownload(downloadId: Long) {
         val existing = _downloads.value.firstOrNull { it.downloadId == downloadId } ?: return
         if (existing.status != DownloadStatus.DOWNLOADING && existing.status != DownloadStatus.QUEUED) return
@@ -254,28 +261,33 @@ class SystemMediaDownloader(private val context: Context) {
         _downloads.update { list ->
             list.map {
                 if (it.downloadId == downloadId) {
-                    it.copy(status = DownloadStatus.FAILED, errorReason = "Cancelled by user")
+                    it.copy(status = DownloadStatus.CANCELLED, errorReason = "Cancelled by user")
                 } else it
             }
         }
         persistQueue(_downloads.value)
     }
 
-    fun deleteDownload(downloadId: Long, deleteLocalFile: Boolean = false) {
+    /**
+     * Removes the item from the queue (and asks DownloadManager to cancel/remove it).
+     * When [deleteLocalFile] is set, also tries to delete the downloaded file; returns false
+     * when that file could not be removed (it may still exist in Downloads).
+     */
+    fun deleteDownload(downloadId: Long, deleteLocalFile: Boolean = false): Boolean {
         val target = _downloads.value.firstOrNull { it.downloadId == downloadId }
+        var fileDeleted = !deleteLocalFile
         if (downloadId >= 0L) {
             runCatching { downloadManager?.remove(downloadId) }
         }
         if (deleteLocalFile && target?.localUri != null) {
-            runCatching {
+            fileDeleted = runCatching {
                 val parsed = Uri.parse(target.localUri)
-                if (parsed.scheme == "file" && parsed.path != null) {
-                    File(parsed.path!!).delete()
-                }
-            }
+                parsed.scheme == "file" && parsed.path?.let { File(it).delete() } == true
+            }.getOrDefault(false)
         }
         _downloads.update { list -> list.filterNot { it.downloadId == downloadId } }
         persistQueue(_downloads.value)
+        return fileDeleted
     }
 
     fun refreshActiveDownloads() {
@@ -298,7 +310,21 @@ class SystemMediaDownloader(private val context: Context) {
         } ?: return
 
         cursor.use { c ->
-            if (!c.moveToFirst()) return
+            if (!c.moveToFirst()) {
+                // DownloadManager no longer knows this id (removed externally, rebooted device,
+                // or cleared state). Surface it as failed instead of leaving a zombie QUEUED row.
+                val missingItem = existing.copy(
+                    status = DownloadStatus.FAILED,
+                    errorReason = "Download is no longer registered with the system download service"
+                )
+                if (missingItem != existing) {
+                    _downloads.update { list ->
+                        list.map { if (it.downloadId == downloadId) missingItem else it }
+                    }
+                    persistQueue(_downloads.value)
+                }
+                return
+            }
             val statusCol = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
             val reasonCol = c.getColumnIndex(DownloadManager.COLUMN_REASON)
             val uriCol = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
@@ -327,10 +353,13 @@ class SystemMediaDownloader(private val context: Context) {
                 bytesDownloaded = bytesDownloaded,
                 bytesTotal = bytesTotal
             )
-            _downloads.update { list ->
-                list.map { if (it.downloadId == downloadId) updatedItem else it }
+            // Persist only on actual change — this is called every poll tick (~750ms).
+            if (updatedItem != existing) {
+                _downloads.update { list ->
+                    list.map { if (it.downloadId == downloadId) updatedItem else it }
+                }
+                persistQueue(_downloads.value)
             }
-            persistQueue(_downloads.value)
 
             if (mappedStatus == DownloadStatus.SUCCEEDED && existing.status != DownloadStatus.SUCCEEDED) {
                 activeCallback?.onDownloadSucceeded(updatedItem)
@@ -338,10 +367,6 @@ class SystemMediaDownloader(private val context: Context) {
                 activeCallback?.onDownloadFailed(updatedItem, errorText ?: "Download failed")
             }
         }
-    }
-
-    fun seedSampleDownloadIfEmptyForDemo() {
-        // Keep genuine empty/user-driven state unless user explicitly initiates downloads
     }
 
     fun clearHistory() {

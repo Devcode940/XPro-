@@ -40,9 +40,6 @@ interface XProDao {
     @Query("SELECT * FROM posts WHERE authorId = :authorId ORDER BY createdAtMillis DESC")
     fun observePostsByAuthor(authorId: String): Flow<List<PostEntity>>
 
-    @Query("SELECT * FROM posts WHERE authorId = :authorId ORDER BY createdAtMillis DESC")
-    fun pagingPostsByAuthor(authorId: String): PagingSource<Int, PostEntity>
-
     @Query("SELECT * FROM posts WHERE isSavedForOffline = 1 ORDER BY offlineCachedAtMillis DESC")
     fun observeReadLaterPosts(): Flow<List<PostEntity>>
 
@@ -98,6 +95,34 @@ interface XProDao {
     @Query("UPDATE posts SET isFollowedAuthor = :isFollowing WHERE authorId = :authorId")
     suspend fun updateFollowStatusForAuthor(authorId: String, isFollowing: Boolean)
 
+    // Remote-delete tombstones (offline deletes replayed on next sync)
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertPendingRemoteDelete(item: PendingRemoteDeleteEntity)
+
+    @Query("SELECT * FROM pending_remote_deletes ORDER BY createdAtMillis ASC")
+    suspend fun getPendingRemoteDeletes(): List<PendingRemoteDeleteEntity>
+
+    @Query("DELETE FROM pending_remote_deletes WHERE id = :id")
+    suspend fun clearPendingRemoteDelete(id: String)
+
+    @Query("SELECT EXISTS(SELECT 1 FROM pending_remote_deletes WHERE id = :id AND kind = :kind)")
+    suspend fun isPendingRemoteDelete(id: String, kind: String): Boolean
+
+    @Query("SELECT * FROM bookmark_folders WHERE id = :folderId LIMIT 1")
+    suspend fun getBookmarkFolderById(folderId: String): BookmarkFolderEntity?
+
+    @Query("SELECT * FROM bookmark_folders WHERE pendingSync = 1")
+    suspend fun getPendingSyncFolders(): List<BookmarkFolderEntity>
+
+    @Query("UPDATE bookmark_folders SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun clearPendingFolders(ids: List<String>)
+
+    @Query("DELETE FROM bookmark_folders WHERE pendingSync = 0 AND updatedAtMillis > 0 AND id NOT IN (:remoteIds)")
+    suspend fun deleteSyncedFoldersNotIn(remoteIds: List<String>)
+
+    @Query("DELETE FROM bookmark_folders WHERE pendingSync = 0 AND updatedAtMillis > 0")
+    suspend fun deleteAllSyncedFolders()
+
     @Query("SELECT * FROM bookmark_folders ORDER BY name ASC")
     fun observeBookmarkFolders(): Flow<List<BookmarkFolderEntity>>
 
@@ -114,6 +139,21 @@ interface XProDao {
     suspend fun clearFolderFromPosts(folderId: String)
 
     // Typed Bookmarks Vault
+    @Query("SELECT * FROM bookmarks_vault WHERE id = :bookmarkId LIMIT 1")
+    suspend fun getTypedBookmarkById(bookmarkId: String): TypedBookmarkEntity?
+
+    @Query("SELECT * FROM bookmarks_vault WHERE pendingSync = 1")
+    suspend fun getPendingSyncTypedBookmarks(): List<TypedBookmarkEntity>
+
+    @Query("UPDATE bookmarks_vault SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun clearPendingTypedBookmarks(ids: List<String>)
+
+    @Query("DELETE FROM bookmarks_vault WHERE pendingSync = 0 AND updatedAtMillis > 0 AND id NOT IN (:remoteIds)")
+    suspend fun deleteSyncedTypedBookmarksNotIn(remoteIds: List<String>)
+
+    @Query("DELETE FROM bookmarks_vault WHERE pendingSync = 0 AND updatedAtMillis > 0")
+    suspend fun deleteAllSyncedTypedBookmarks()
+
     @Query("SELECT * FROM bookmarks_vault ORDER BY createdAtMillis DESC")
     fun observeTypedBookmarks(): Flow<List<TypedBookmarkEntity>>
 
@@ -129,8 +169,11 @@ interface XProDao {
     @Query("UPDATE bookmarks_vault SET folderId = :folderId WHERE id = :bookmarkId")
     suspend fun updateTypedBookmarkFolder(bookmarkId: String, folderId: String?)
 
-    @Query("UPDATE bookmarks_vault SET folderId = NULL WHERE folderId = :folderId")
-    suspend fun clearFolderFromTypedBookmarks(folderId: String)
+    @Query("UPDATE bookmarks_vault SET pendingSync = 1, updatedAtMillis = :updatedAtMillis WHERE id = :bookmarkId")
+    suspend fun markTypedBookmarkPendingSync(bookmarkId: String, updatedAtMillis: Long)
+
+    @Query("UPDATE bookmarks_vault SET folderId = NULL, pendingSync = 1, updatedAtMillis = :updatedAtMillis WHERE folderId = :folderId")
+    suspend fun clearFolderFromTypedBookmarks(folderId: String, updatedAtMillis: Long)
 
     @Query("DELETE FROM bookmarks_vault WHERE id = :bookmarkId")
     suspend fun deleteTypedBookmarkById(bookmarkId: String)
@@ -267,6 +310,9 @@ interface XProDao {
 
     @Query("DELETE FROM playlists WHERE id = :playlistId")
     suspend fun deletePlaylistById(playlistId: String)
+
+    @Query("UPDATE media_library SET playlistId = NULL WHERE playlistId = :playlistId")
+    suspend fun clearPlaylistFromMedia(playlistId: String)
 
     // Application Tools (Saved Pages, Reading List, Browser History, Feedback)
     @Query("SELECT * FROM saved_pages ORDER BY savedAtMillis DESC")

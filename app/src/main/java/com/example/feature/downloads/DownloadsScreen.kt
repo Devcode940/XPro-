@@ -374,6 +374,7 @@ private fun DownloadManagementCard(
         DownloadStatus.FAILED -> colorScheme.error
         DownloadStatus.PAUSED -> colorScheme.secondary
         DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING -> colorScheme.primary
+        DownloadStatus.CANCELLED -> colorScheme.onSurfaceVariant
     }
 
     val progress = if (item.bytesTotal > 0L) {
@@ -439,6 +440,14 @@ private fun DownloadManagementCard(
 
             if (item.status == DownloadStatus.QUEUED || item.status == DownloadStatus.DOWNLOADING || item.status == DownloadStatus.PAUSED) {
                 Spacer(modifier = Modifier.height(10.dp))
+                if (item.status == DownloadStatus.PAUSED) {
+                    Text(
+                        text = "DownloadManager can't pause; resume re-downloads from the start.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colorScheme.secondary
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
                 if (item.bytesTotal > 0L) {
                     LinearProgressIndicator(
                         progress = { progress },
@@ -483,7 +492,7 @@ private fun DownloadManagementCard(
                     Button(onClick = onResume) {
                         Icon(Icons.Filled.PlayArrow, null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Resume")
+                        Text("Resume from start")
                     }
                     OutlinedButton(onClick = onCancel) {
                         Icon(Icons.Filled.Cancel, null, modifier = Modifier.size(16.dp), tint = colorScheme.error)

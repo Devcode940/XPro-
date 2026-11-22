@@ -8,7 +8,6 @@ import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.NoCredentialException
-import com.example.R
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
@@ -22,6 +21,21 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
 private const val TAG = "GoogleAuthHelper"
+
+/**
+ * The google-services plugin generates `default_web_client_id` only when a
+ * google-services.json is present at build time. Reading it via resources.getIdentifier keeps
+ * the app buildable/runnable without the file: sign-in reports "not configured" instead of
+ * failing compilation.
+ */
+private fun defaultWebClientId(context: Context): String? {
+    val resId = context.resources.getIdentifier(
+        "default_web_client_id",
+        "string",
+        context.packageName
+    )
+    return if (resId != 0) context.getString(resId).takeIf { it.isNotBlank() } else null
+}
 
 sealed interface AuthResultState {
     data class Authenticated(
@@ -61,7 +75,8 @@ object GoogleAuthHelper {
             if (FirebaseApp.getApps(activityContext).isEmpty()) {
                 FirebaseApp.initializeApp(activityContext)
             }
-            val clientId = activityContext.getString(R.string.default_web_client_id)
+            val clientId = defaultWebClientId(activityContext)
+                ?: return AuthResultState.NoSavedCredential
             val option = GetGoogleIdOption.Builder()
                 .setFilterByAuthorizedAccounts(true)
                 .setServerClientId(clientId)
@@ -92,7 +107,10 @@ object GoogleAuthHelper {
             if (FirebaseApp.getApps(activityContext).isEmpty()) {
                 FirebaseApp.initializeApp(activityContext)
             }
-            val clientId = activityContext.getString(R.string.default_web_client_id)
+            val clientId = defaultWebClientId(activityContext)
+                ?: return AuthResultState.Error(
+                    "Google Sign-In is not configured in this build (missing google-services.json). Use Guest mode."
+                )
             val signInOption = GetSignInWithGoogleOption.Builder(clientId).build()
             val request = GetCredentialRequest.Builder()
                 .addCredentialOption(signInOption)

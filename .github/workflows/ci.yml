@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Firestore security rules: runs the emulator-backed suite in firestore.test.js
+  # against firestore.rules. Requires a JDK for the Firestore emulator (setup-java).
+  firestore-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies (locked)
+        run: npm ci
+
+      - name: Run Firestore rules tests (emulator)
+        run: npm run test:rules
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # ubuntu-latest ships the Android SDK (ANDROID_HOME) preinstalled; no extra setup step needed.
+
+      - name: Generate debug keystore (git-ignored, required for assembleDebug)
+        run: bash tools/generate-debug-keystore.sh
+
+      # No committed gradle-wrapper.jar: install Gradle 9.3.1 (matching gradle/wrapper/gradle-wrapper.properties) via SDKMAN.
+      - name: Install Gradle 9.3.1
+        run: |
+          curl -s "https://get.sdkman.io" | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install gradle 9.3.1
+
+      - name: Assemble debug APK
+        run: |
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          gradle :app:assembleDebug :media-downloader:assembleDebug --stacktrace
+
+      - name: Unit tests (app + module)
+        run: |
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          gradle :app:testDebugUnitTest :media-downloader:testDebugUnitTest --stacktrace

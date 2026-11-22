@@ -37,12 +37,12 @@ class SettingsRepository(private val context: Context) {
                 ?.split(",")
                 ?.map { it.trim() }
                 ?.filter { it.isNotBlank() }
-                ?: listOf("@spam_bot_99"),
+                ?: emptyList(),
             mutedAccounts = prefs[KEY_MUTED_ACCOUNTS]
                 ?.split(",")
                 ?.map { it.trim() }
                 ?.filter { it.isNotBlank() }
-                ?: listOf("@crypto_promo_daily"),
+                ?: emptyList(),
             pushNotifications = prefs[KEY_PUSH_NOTIFS] ?: true,
             notifyLikes = prefs[KEY_NOTIFY_LIKES] ?: true,
             notifyComments = prefs[KEY_NOTIFY_COMMENTS] ?: true,

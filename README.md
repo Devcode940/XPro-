@@ -170,9 +170,11 @@ no committed schema JSONs, which is why there is no automated migration test yet
 
 ## Backup & privacy
 
-`android:allowBackup` stays enabled but backup rules now exclude the Room database and all
-app-private files (`backup_rules.xml`, `data_extraction_rules.xml`) — drafts, DMs and bookmarks
-never leave the device via cloud backup. Firestore holds only bookmark/folder data per user,
+`android:allowBackup` stays enabled but backup rules exclude the Room database, all app-private
+files, `sharedpref` and external storage (`backup_rules.xml`, `data_extraction_rules.xml`) —
+drafts, DMs, bookmarks, the download queue and the App Check debug token never leave the device
+via cloud backup or device transfer. App settings live in DataStore, so a restore starts from
+defaults instead of resurrecting private content. Firestore holds only bookmark/folder data per user,
 guarded by `firestore.rules` (auth-scoped, owner-only, field/type/length/enum validated), and
 locally that data is partitioned by `ownerUid` so one account's rows are never sent to another.
 `FirestoreErrorHandler` logs sanitized diagnostics only — no uid/email/provider PII.

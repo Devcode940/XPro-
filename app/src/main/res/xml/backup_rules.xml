@@ -1,11 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Production backup policy: back up shared preferences (app settings only), but never the
-  Room database — it contains private bookmarks, drafts, DMs and feedback.
+  Backup policy (Android 11 and below; Android 12+ uses data_extraction_rules.xml).
+
+  Nothing app-private leaves the device: the Room database holds bookmarks, drafts, DMs and
+  feedback, and SharedPreferences hold the download queue and the App Check debug token.
+
+  Note: app settings live in DataStore, which is a *file*-domain entry, so the blanket
+  `file` exclusion below also excludes them. After a restore, settings fall back to their
+  defaults — deliberate, since a restore must never resurrect private content.
 -->
 <full-backup-content>
     <exclude domain="database" path="xpro_unlocked.db" />
     <exclude domain="database" path="xpro_unlocked.db-wal" />
     <exclude domain="database" path="xpro_unlocked.db-shm" />
+    <!-- SharedPreferences: download queue + App Check debug secret. Not user content, but
+         device-specific and pointless (or harmful) to restore elsewhere. -->
+    <exclude domain="sharedpref" path="." />
     <exclude domain="file" path="." />
+    <exclude domain="external" path="." />
 </full-backup-content>

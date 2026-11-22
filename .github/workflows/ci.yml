@@ -64,29 +64,37 @@ jobs:
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
+      # tools/ci-gradle.sh re-emits a failure as a check annotation, so a red build stays
+      # diagnosable even where the job log archive is unreachable.
       - name: Assemble debug APK
         run: |
           source "$HOME/.sdkman/bin/sdkman-init.sh"
-          gradle :app:assembleDebug :media-downloader:assembleDebug --stacktrace
+          bash tools/ci-gradle.sh "assembleDebug failed" \
+            gradle :app:assembleDebug :media-downloader:assembleDebug --stacktrace
 
       - name: Unit tests (app + module)
         run: |
           source "$HOME/.sdkman/bin/sdkman-init.sh"
-          gradle :app:testDebugUnitTest :media-downloader:testDebugUnitTest --stacktrace
+          bash tools/ci-gradle.sh "Unit tests failed" \
+            gradle :app:testDebugUnitTest :media-downloader:testDebugUnitTest --stacktrace
 
       # R8 + resource shrinking only run in release builds, so nothing above would notice a
       # keep-rule or shrinking problem. Sign with a throwaway upload keystore that matches the
       # `release` signingConfig (app/build.gradle.kts reads these env vars).
+      # STORE_PASSWORD and KEY_PASSWORD must match: keytool writes a PKCS12 store, which ignores
+      # -keypass and protects the private key with the store password. Different values make
+      # :app:packageRelease fail with "Given final block not properly padded".
       - name: Assemble release APK (R8 smoke test)
         env:
           KEYSTORE_PATH: ${{ github.workspace }}/ci-upload-key.jks
-          STORE_PASSWORD: ci-store-password
-          KEY_PASSWORD: ci-key-password
+          STORE_PASSWORD: ci-keystore-password
+          KEY_PASSWORD: ci-keystore-password
         run: |
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           keytool -genkeypair -v -keystore "$KEYSTORE_PATH" -alias upload \
             -storepass "$STORE_PASSWORD" -keypass "$KEY_PASSWORD" \
             -keyalg RSA -keysize 2048 -validity 3650 \
             -dname "CN=CI Upload,O=XPro,C=US"
-          gradle :app:assembleRelease --stacktrace
+          bash tools/ci-gradle.sh "assembleRelease failed" \
+            gradle :app:assembleRelease --stacktrace
           ls -l app/build/outputs/apk/release/

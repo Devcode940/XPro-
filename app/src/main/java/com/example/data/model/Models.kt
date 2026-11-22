@@ -134,7 +134,9 @@ data class BookmarkFolder(
     val description: String,
     val colorHex: Long,
     val iconKey: String,
-    val count: Int = 0
+    val count: Int = 0,
+    /** Server timestamp of the last remote write, 0 when never synced. Used for conflict tests. */
+    val updatedAtMillis: Long = 0L
 )
 
 data class TypedBookmarkItem(

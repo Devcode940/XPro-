@@ -31,6 +31,9 @@ import org.robolectric.annotation.Config
 @Config(sdk = [36])
 class SyncMergeTest {
 
+    private val alice = "alice_uid"
+    private val bob = "bob_uid"
+
     private lateinit var db: XProDatabase
     private lateinit var repository: XProRepository
 
@@ -56,7 +59,8 @@ class SyncMergeTest {
         val now = System.currentTimeMillis()
         // Simulate a row that arrived from Firestore (synced, updatedAt > 0).
         repository.mergeRemoteBookmarks(
-            listOf(
+            ownerUid = alice,
+            remoteItems = listOf(
                 TypedBookmarkItem(
                     id = "tb_remote_1",
                     itemType = BookmarkItemType.LINK,
@@ -72,6 +76,7 @@ class SyncMergeTest {
         assertTrue(repository.typedBookmarks.first().any { it.id == "tb_remote_1" })
 
         // A local-only row (pending sync, never pushed).
+        repository.setActiveOwner(alice)
         repository.addTypedBookmark(
             itemType = BookmarkItemType.LINK,
             title = "Local only",
@@ -82,7 +87,7 @@ class SyncMergeTest {
         )
 
         // Remote snapshot is now empty => remote delete must propagate, local pending row must survive.
-        repository.mergeRemoteBookmarks(emptyList())
+        repository.mergeRemoteBookmarks(ownerUid = alice, remoteItems = emptyList())
 
         val ids = repository.typedBookmarks.first().map { it.id }
         assertFalse("synced row should be deleted", "tb_remote_1" in ids)
@@ -92,6 +97,7 @@ class SyncMergeTest {
     @Test
     fun `local pending row is not overwritten by remote snapshot`() = runBlocking {
         val now = System.currentTimeMillis()
+        repository.setActiveOwner(alice)
         repository.addTypedBookmark(
             itemType = BookmarkItemType.LINK,
             title = "Local title",
@@ -101,7 +107,8 @@ class SyncMergeTest {
             customId = "tb_pending_wins"
         )
         repository.mergeRemoteBookmarks(
-            listOf(
+            ownerUid = alice,
+            remoteItems = listOf(
                 TypedBookmarkItem(
                     id = "tb_pending_wins",
                     itemType = BookmarkItemType.LINK,
@@ -122,7 +129,7 @@ class SyncMergeTest {
     fun `empty remote snapshot keeps seeded never-synced rows`() = runBlocking {
         val seededIds = repository.typedBookmarks.first().map { it.id }
         assertTrue(seededIds.isNotEmpty())
-        repository.mergeRemoteBookmarks(emptyList())
+        repository.mergeRemoteBookmarks(ownerUid = alice, remoteItems = emptyList())
         assertEquals(seededIds.toSet(), repository.typedBookmarks.first().map { it.id }.toSet())
     }
 
@@ -130,11 +137,120 @@ class SyncMergeTest {
     fun `assignBookmark keeps original createdAt when re-saving same post`() = runBlocking {
         val first = repository.assignBookmark("post_poll_1", null)
             ?: error("assignBookmark returned null for seed post post_poll_1")
-        Thread.sleep(5)
         repository.assignBookmark("post_poll_1", "folder_eng")
         val stored = repository.typedBookmarks.first().first { it.id == first.id }
         assertEquals(first.createdAtMillis, stored.createdAtMillis)
         assertEquals("folder_eng", stored.folderId)
+    }
+
+    @Test
+    fun `a second account never pushes the first account's pending rows`() = runBlocking {
+        repository.setActiveOwner(alice)
+        repository.addTypedBookmark(
+            itemType = BookmarkItemType.LINK,
+            title = "Alice private",
+            content = "owned by alice",
+            authorName = "Alice",
+            authorHandle = "@alice",
+            customId = "tb_alice_pending"
+        )
+
+        // Bob signs in on the same device.
+        repository.setActiveOwner(bob)
+        repository.claimUnownedRows(bob)
+
+        val bobPending = repository.getPendingSyncBookmarks(bob).map { it.id }
+        assertFalse("bob must not inherit alice's pending row", "tb_alice_pending" in bobPending)
+        assertTrue(
+            "alice's row stays pending for her own next sync",
+            "tb_alice_pending" in repository.getPendingSyncBookmarks(alice).map { it.id }
+        )
+    }
+
+    @Test
+    fun `reconcile for one account never deletes another account's synced rows`() = runBlocking {
+        val now = System.currentTimeMillis()
+        repository.mergeRemoteBookmarks(
+            ownerUid = alice,
+            remoteItems = listOf(
+                TypedBookmarkItem(
+                    id = "tb_alice_synced",
+                    itemType = BookmarkItemType.POST,
+                    title = "Alice synced",
+                    content = "from alice's cloud",
+                    authorName = "Alice",
+                    authorHandle = "@alice",
+                    createdAtMillis = now - 10_000,
+                    updatedAtMillis = now - 5_000
+                )
+            )
+        )
+
+        repository.setActiveOwner(bob)
+        repository.claimUnownedRows(bob)
+        repository.addTypedBookmark(
+            itemType = BookmarkItemType.LINK,
+            title = "Bob local",
+            content = "owned by bob",
+            authorName = "Bob",
+            authorHandle = "@bob",
+            customId = "tb_bob_synced"
+        )
+        repository.markBookmarksSynced(bob, listOf("tb_bob_synced"))
+
+        // Bob's cloud is empty; that must not delete Alice's synced row.
+        repository.mergeRemoteBookmarks(ownerUid = bob, remoteItems = emptyList())
+
+        val ids = repository.typedBookmarks.first().map { it.id }
+        assertTrue("alice's synced row must survive bob's reconcile", "tb_alice_synced" in ids)
+        assertFalse("bob's own synced row is reconciled away", "tb_bob_synced" in ids)
+    }
+
+    @Test
+    fun `seeded demo rows are never claimed or uploaded by sign-in`() = runBlocking {
+        // Seed data lands with updatedAtMillis = 0 and pendingSync = false: it has never been
+        // pushed anywhere, so signing in must not upload the demo persona to a real account.
+        repository.claimUnownedRows(alice)
+
+        assertTrue(repository.getPendingSyncBookmarks(alice).isEmpty())
+        assertTrue(repository.getPendingSyncFolders(alice).isEmpty())
+        assertTrue(repository.typedBookmarks.first().isNotEmpty())
+    }
+
+    @Test
+    fun `deleting a never-synced row does not tombstone a remote delete`() = runBlocking {
+        val seeded = repository.typedBookmarks.first().first()
+
+        repository.setActiveOwner(null) // guest mode
+        repository.deleteTypedBookmark(seeded.id, seeded.postId)
+
+        assertTrue(
+            "a never-synced delete has nothing to delete remotely",
+            repository.getPendingRemoteDeletes(alice).isEmpty()
+        )
+    }
+
+    @Test
+    fun `guest deletes are replayed for the account that claims them`() = runBlocking {
+        repository.setActiveOwner(null)
+        val created = repository.addTypedBookmark(
+            itemType = BookmarkItemType.LINK,
+            title = "Saved while signed out",
+            content = "guest bookmark",
+            authorName = "Guest",
+            authorHandle = "@guest",
+            customId = "tb_guest_deleted"
+        )
+        repository.deleteTypedBookmark(created.id, null)
+
+        repository.setActiveOwner(alice)
+        repository.claimUnownedRows(alice)
+
+        assertEquals(
+            listOf("tb_guest_deleted"),
+            repository.getPendingRemoteDeletes(alice).map { it.id }
+        )
+        assertTrue(repository.getPendingRemoteDeletes(bob).isEmpty())
     }
 
     @Test

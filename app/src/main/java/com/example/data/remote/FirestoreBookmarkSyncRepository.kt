@@ -51,7 +51,21 @@ data class SyncedBookmarkFolderDoc(
 
 sealed interface FirestoreSyncResult<out T> {
     data object Loading : FirestoreSyncResult<Nothing>
-    data class Success<T>(val data: T) : FirestoreSyncResult<T>
+
+    /**
+     * A result from the server (or a placeholder emitted because sync is unavailable).
+     *
+     * [isAuthoritative] distinguishes a real, server-confirmed snapshot from (a) a snapshot
+     * served out of the local Firestore cache and (b) the empty placeholder returned when
+     * Firebase is missing or the caller is not authenticated as [SyncedBookmarkDoc.userId].
+     * Only authoritative snapshots may drive a destructive reconcile — treating a cache or
+     * placeholder result as "the server says zero documents" would delete every synced row.
+     */
+    data class Success<T>(
+        val data: T,
+        val isAuthoritative: Boolean = false
+    ) : FirestoreSyncResult<T>
+
     data class Error(val message: String, val cause: Throwable) : FirestoreSyncResult<Nothing>
 }
 
@@ -119,7 +133,13 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
                             DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                         )
                     } ?: emptyList()
-                    trySend(FirestoreSyncResult.Success(docs))
+                    // Cache-sourced snapshots are shown as-is but must never trigger a reconcile.
+                    trySend(
+                        FirestoreSyncResult.Success(
+                            data = docs,
+                            isAuthoritative = snapshot != null && !snapshot.metadata.isFromCache
+                        )
+                    )
                 }
             awaitClose { registration.remove() }
         }
@@ -151,7 +171,12 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
                             DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                         )
                     } ?: emptyList()
-                    trySend(FirestoreSyncResult.Success(docs))
+                    trySend(
+                        FirestoreSyncResult.Success(
+                            data = docs,
+                            isAuthoritative = snapshot != null && !snapshot.metadata.isFromCache
+                        )
+                    )
                 }
             awaitClose { registration.remove() }
         }

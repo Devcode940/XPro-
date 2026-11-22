@@ -147,9 +147,15 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
     private val firestoreSync by lazy { FirestoreBookmarkSyncRepository(application) }
     @Volatile private var cloudUid: String? = null
 
-    /** Called by MainActivity whenever the signed-in Firebase uid changes (null = guest). */
+    /**
+     * Called by MainActivity whenever the signed-in Firebase uid changes (null = guest).
+     *
+     * Also tells the repository who owns new rows: writes are stamped with the active account, so
+     * switching accounts cannot re-upload (or reconcile away) the previous account's bookmarks.
+     */
     fun setCloudSyncUid(uid: String?) {
         cloudUid = uid
+        repository.setActiveOwner(uid)
     }
 
     private fun pushBookmarkUpsert(item: TypedBookmarkItem) {
@@ -167,7 +173,7 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
                 linkUrl = item.linkUrl,
                 folderId = item.folderId
             )) {
-                SyncWriteResult.Synced -> repository.markBookmarksSynced(listOf(item.id))
+                SyncWriteResult.Synced -> repository.markBookmarksSynced(uid, listOf(item.id))
                 else -> Unit // stays pendingSync; retried on next sign-in/sync
             }
         }
@@ -184,7 +190,7 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun pushFolderUpsert(id: String, name: String, description: String, colorHex: Long, iconKey: String) {
         val uid = cloudUid ?: return
         when (firestoreSync.upsertFolder(uid, id, name.trim(), description.trim(), colorHex, iconKey)) {
-            SyncWriteResult.Synced -> repository.markFoldersSynced(listOf(id))
+            SyncWriteResult.Synced -> repository.markFoldersSynced(uid, listOf(id))
             else -> Unit
         }
     }

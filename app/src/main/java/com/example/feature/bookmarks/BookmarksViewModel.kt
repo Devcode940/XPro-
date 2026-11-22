@@ -35,6 +35,17 @@ enum class BookmarkFilterCategory(val label: String) {
     READ_LATER("Read Later ⚡")
 }
 
+/**
+ * One emission of the remote listeners, tagged with the account it belongs to. Keeping the uid
+ * next to the payload is what makes reconcile safe: a snapshot can never be applied to a
+ * different account than the one it was requested for.
+ */
+private data class RemoteState(
+    val uid: String?,
+    val bookmarks: FirestoreSyncResult<List<com.example.data.remote.SyncedBookmarkDoc>>?,
+    val folders: FirestoreSyncResult<List<com.example.data.remote.SyncedBookmarkFolderDoc>>?
+)
+
 data class BookmarksUiState(
     val selectedCategory: BookmarkFilterCategory = BookmarkFilterCategory.ALL,
     val selectedFolderId: String? = null,
@@ -61,85 +72,115 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
     private val searchQuery = MutableStateFlow("")
     private val syncStatus = MutableStateFlow<Pair<Boolean, String?>>(false to null)
     private val bannerState = MutableStateFlow<String?>(null)
+    private val syncRetryTick = MutableStateFlow(0)
 
     init {
         viewModelScope.launch {
             localRepo.ensureSeeded()
         }
 
-        // Only attach Firestore listeners when authenticated (uid != null).
-        // Guest mode remains strictly Room-local with zero Firestore network calls.
-        // First: replay offline deletes, then push locally-pending writes made while signed out/offline.
+        // Ownership + push. Runs on every account change *and* on every retry request, so a
+        // failed push is no longer stranded until the next cold start.
         viewModelScope.launch {
-            activeUid.collectLatest { uid ->
-                if (!uid.isNullOrBlank()) {
-                    pushPendingSync(uid)
+            combine(activeUid, syncRetryTick) { uid, tick -> uid to tick }
+                .collectLatest { (uid, tick) ->
+                    localRepo.setActiveOwner(uid)
+                    if (uid.isNullOrBlank()) {
+                        syncStatus.value = false to null
+                    } else {
+                        // Only a user-initiated retry reports success; an automatic push at
+                        // sign-in should stay quiet unless something failed.
+                        pushPendingSync(uid, notifyOnSuccess = tick > 0)
+                    }
                 }
-            }
         }
 
+        // Only attach Firestore listeners when authenticated (uid != null).
+        // Guest mode remains strictly Room-local with zero Firestore network calls.
         activeUid.flatMapLatest { uid ->
             if (uid.isNullOrBlank()) {
                 syncStatus.value = false to null
-                flowOf(null to null)
+                flowOf(RemoteState(uid = null, bookmarks = null, folders = null))
             } else {
                 combine(
                     firestoreRepo.observeRemoteBookmarks(uid),
                     firestoreRepo.observeRemoteFolders(uid)
-                ) { bookmarksRes, foldersRes ->
-                    bookmarksRes to foldersRes
-                }
+                ) { bookmarksRes, foldersRes -> RemoteState(uid, bookmarksRes, foldersRes) }
             }
-        }.onEach { pair ->
-            val bookmarksRes = pair.first
-            val foldersRes = pair.second
-            if (bookmarksRes is FirestoreSyncResult.Loading || foldersRes is FirestoreSyncResult.Loading) {
-                syncStatus.value = true to null
+        }.onEach { state ->
+            val bookmarksRes = state.bookmarks
+            val foldersRes = state.folders
+            if (bookmarksRes == null || foldersRes == null) {
+                syncStatus.value = false to null
+                return@onEach
+            }
+            syncStatus.value = if (
+                bookmarksRes is FirestoreSyncResult.Loading || foldersRes is FirestoreSyncResult.Loading
+            ) {
+                true to null
             } else {
-                val err = (bookmarksRes as? FirestoreSyncResult.Error)?.message
-                    ?: (foldersRes as? FirestoreSyncResult.Error)?.message
-                syncStatus.value = false to err
+                false to (
+                    (bookmarksRes as? FirestoreSyncResult.Error)?.message
+                        ?: (foldersRes as? FirestoreSyncResult.Error)?.message
+                    )
             }
 
-            if (foldersRes is FirestoreSyncResult.Success) {
-                val domainFolders = foldersRes.data.map { doc ->
-                    BookmarkFolder(
-                        id = doc.id,
-                        name = doc.name,
-                        description = doc.description,
-                        colorHex = doc.colorHex,
-                        iconKey = doc.iconKey
-                    )
-                }
-                localRepo.mergeRemoteFolders(domainFolders)
+            val uid = state.uid ?: return@onEach
+            // Reconcile is destructive (it deletes local rows that are gone remotely), so it is
+            // only ever applied to an authoritative server snapshot — never to a cache-sourced
+            // one, and never when Firebase turned out to be unavailable.
+            if (foldersRes is FirestoreSyncResult.Success && foldersRes.isAuthoritative) {
+                localRepo.mergeRemoteFolders(
+                    ownerUid = uid,
+                    remoteFolders = foldersRes.data.map { doc ->
+                        BookmarkFolder(
+                            id = doc.id,
+                            name = doc.name,
+                            description = doc.description,
+                            colorHex = doc.colorHex,
+                            iconKey = doc.iconKey,
+                            updatedAtMillis = doc.updatedAt?.toDate()?.time ?: 0L
+                        )
+                    }
+                )
             }
-            if (bookmarksRes is FirestoreSyncResult.Success) {
+            if (bookmarksRes is FirestoreSyncResult.Success && bookmarksRes.isAuthoritative) {
                 val now = System.currentTimeMillis()
-                val domainBookmarks = bookmarksRes.data.map { doc ->
-                    val created = doc.createdAt?.toDate()?.time ?: now
-                    TypedBookmarkItem(
-                        id = doc.id,
-                        itemType = runCatching { BookmarkItemType.valueOf(doc.itemType) }.getOrDefault(BookmarkItemType.POST),
-                        title = doc.title,
-                        content = doc.content,
-                        authorName = doc.authorName,
-                        authorHandle = doc.authorHandle,
-                        mediaUrl = doc.mediaUrl,
-                        linkUrl = doc.linkUrl,
-                        folderId = doc.folderId,
-                        postId = null,
-                        createdAtMillis = created,
-                        updatedAtMillis = doc.updatedAt?.toDate()?.time ?: created
-                    )
-                }
-                localRepo.mergeRemoteBookmarks(domainBookmarks)
+                localRepo.mergeRemoteBookmarks(
+                    ownerUid = uid,
+                    remoteItems = bookmarksRes.data.map { doc ->
+                        val created = doc.createdAt?.toDate()?.time ?: now
+                        TypedBookmarkItem(
+                            id = doc.id,
+                            itemType = runCatching { BookmarkItemType.valueOf(doc.itemType) }
+                                .getOrDefault(BookmarkItemType.POST),
+                            title = doc.title,
+                            content = doc.content,
+                            authorName = doc.authorName,
+                            authorHandle = doc.authorHandle,
+                            mediaUrl = doc.mediaUrl,
+                            linkUrl = doc.linkUrl,
+                            folderId = doc.folderId,
+                            postId = null,
+                            createdAtMillis = created,
+                            updatedAtMillis = doc.updatedAt?.toDate()?.time ?: created
+                        )
+                    }
+                )
             }
         }.launchIn(viewModelScope)
     }
 
-    /** Replays tombstoned deletes and pushes locally-pending writes; returns nothing but sets a banner on failure. */
-    private suspend fun pushPendingSync(uid: String) {
-        localRepo.getPendingRemoteDeletes().forEach { tombstone ->
+    /**
+     * Claims device-local rows for [uid], replays tombstoned deletes, then pushes pending
+     * folders and bookmarks. Every query is scoped to [uid], so rows belonging to a previously
+     * signed-in account are never uploaded or deleted on its behalf.
+     */
+    private suspend fun pushPendingSync(uid: String, notifyOnSuccess: Boolean = false) {
+        localRepo.claimUnownedRows(uid)
+        var pushed = 0
+
+        localRepo.getPendingRemoteDeletes(uid).forEach { tombstone ->
             val res = when (tombstone.kind) {
                 PendingRemoteDeleteKind.BOOKMARK -> firestoreRepo.deleteBookmark(uid, tombstone.id)
                 PendingRemoteDeleteKind.FOLDER -> firestoreRepo.deleteFolder(uid, tombstone.id)
@@ -151,13 +192,16 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         var failures = 0
-        localRepo.getPendingSyncFolders().forEach { folder ->
+        localRepo.getPendingSyncFolders(uid).forEach { folder ->
             when (firestoreRepo.upsertFolder(uid, folder.id, folder.name, folder.description, folder.colorHex, folder.iconKey)) {
-                SyncWriteResult.Synced -> localRepo.markFoldersSynced(listOf(folder.id))
+                SyncWriteResult.Synced -> {
+                    pushed++
+                    localRepo.markFoldersSynced(uid, listOf(folder.id))
+                }
                 else -> failures++
             }
         }
-        localRepo.getPendingSyncBookmarks().forEach { item ->
+        localRepo.getPendingSyncBookmarks(uid).forEach { item ->
             when (firestoreRepo.upsertBookmark(
                 uid = uid,
                 bookmarkId = item.id,
@@ -170,12 +214,19 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                 linkUrl = item.linkUrl,
                 folderId = item.folderId
             )) {
-                SyncWriteResult.Synced -> localRepo.markBookmarksSynced(listOf(item.id))
+                SyncWriteResult.Synced -> {
+                    pushed++
+                    localRepo.markBookmarksSynced(uid, listOf(item.id))
+                }
                 else -> failures++
             }
         }
-        if (failures > 0) {
-            bannerState.value = "$failures change(s) couldn't be synced — kept on device, will retry on next sync"
+        if (failures == 0) syncStatus.value = false to null
+        when {
+            failures > 0 -> bannerState.value =
+                "$failures change(s) couldn't be synced — kept on this device. Tap Sync to retry."
+            notifyOnSuccess && pushed > 0 -> bannerState.value = "Synced $pushed change(s) with Firestore"
+            notifyOnSuccess -> bannerState.value = "Everything is already in sync"
         }
     }
 
@@ -262,6 +313,15 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         activeUid.value = uid
     }
 
+    /** User-triggered sync: re-plays tombstones and pending writes for the current account. */
+    fun retrySync() {
+        if (activeUid.value.isNullOrBlank()) {
+            bannerState.value = "Sign in with Google to synchronize collections with Firestore"
+            return
+        }
+        syncRetryTick.update { it + 1 }
+    }
+
     fun selectCategory(category: BookmarkFilterCategory) {
         selectedCategory.value = category
     }
@@ -281,7 +341,7 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
             val uid = activeUid.value
             if (uid != null) {
                 when (val res = firestoreRepo.upsertFolder(uid, id, name.trim(), description.trim(), colorHex, "folder")) {
-                    SyncWriteResult.Synced -> localRepo.markFoldersSynced(listOf(id))
+                    SyncWriteResult.Synced -> localRepo.markFoldersSynced(uid, listOf(id))
                     is SyncWriteResult.Failed -> {
                         bannerState.value = "Collection saved on this device — sync failed: ${res.message}"
                         return@launch
@@ -327,7 +387,7 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                     linkUrl = created.linkUrl,
                     folderId = created.folderId
                 )) {
-                    SyncWriteResult.Synced -> localRepo.markBookmarksSynced(listOf(created.id))
+                    SyncWriteResult.Synced -> localRepo.markBookmarksSynced(uid, listOf(created.id))
                     is SyncWriteResult.Failed -> {
                         bannerState.value = "Saved on this device — sync failed: ${res.message}"
                         return@launch
@@ -357,7 +417,7 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
                     linkUrl = bookmark.linkUrl,
                     folderId = folderId
                 )) {
-                    SyncWriteResult.Synced -> localRepo.markBookmarksSynced(listOf(bookmark.id))
+                    SyncWriteResult.Synced -> localRepo.markBookmarksSynced(uid, listOf(bookmark.id))
                     is SyncWriteResult.Failed -> {
                         bannerState.value = "Moved locally — sync failed: ${res.message}"
                         return@launch
@@ -402,52 +462,18 @@ class BookmarksViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * Manual "sync now". Previously this pushed whatever the UI happened to be showing, which
+     * included rows owned by other accounts; it now goes through the same scoped push path.
+     */
     fun pushAllLocalToFirestoreNow() {
-        val uid = activeUid.value
-        if (uid.isNullOrBlank()) {
+        if (activeUid.value.isNullOrBlank()) {
             bannerState.value = "Sign in with Google to synchronize collections with Firestore"
             return
         }
         viewModelScope.launch {
             syncStatus.value = true to null
-            val current = uiState.value
-            var synced = 0
-            var failed = 0
-            current.folders.forEach { folder ->
-                when (firestoreRepo.upsertFolder(uid, folder.id, folder.name, folder.description, folder.colorHex, folder.iconKey)) {
-                    SyncWriteResult.Synced -> {
-                        synced++
-                        localRepo.markFoldersSynced(listOf(folder.id))
-                    }
-                    else -> failed++
-                }
-            }
-            current.typedBookmarks.forEach { item ->
-                when (firestoreRepo.upsertBookmark(
-                    uid = uid,
-                    bookmarkId = item.id,
-                    title = item.title,
-                    content = item.content,
-                    authorName = item.authorName,
-                    authorHandle = item.authorHandle,
-                    itemType = item.itemType.name,
-                    mediaUrl = item.mediaUrl,
-                    linkUrl = item.linkUrl,
-                    folderId = item.folderId
-                )) {
-                    SyncWriteResult.Synced -> {
-                        synced++
-                        localRepo.markBookmarksSynced(listOf(item.id))
-                    }
-                    else -> failed++
-                }
-            }
-            syncStatus.value = false to null
-            bannerState.value = if (failed == 0) {
-                "Synchronized $synced item(s) with Firestore"
-            } else {
-                "Synced $synced item(s); $failed failed — check your connection and try again"
-            }
+            retrySync()
         }
     }
 

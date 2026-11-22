@@ -7,6 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.BuildConfig
 
 @Database(
     entities = [
@@ -28,7 +29,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         BrowserHistoryEntity::class,
         FeedbackEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 @TypeConverters(XProTypeConverters::class)
@@ -64,6 +65,29 @@ abstract class XProDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v4 -> v5: scopes synced rows to the Google account that owns them.
+         *
+         * Nullable with no SQL default on purpose: `ALTER TABLE ... ADD COLUMN` needs no default
+         * for a nullable column, and Room validates the declared schema against the migrated one.
+         * Legacy rows come out unowned (device-local); [XProDao.claimUnownedTypedBookmarks] binds
+         * them to the first account that signs in.
+         *
+         * The two `UPDATE`s undo an over-eager side effect of v3 -> v4, which flagged *every*
+         * pre-existing row as `pendingSync = 1` — including seeded demo content. Rows with
+         * `updatedAtMillis = 0` were never pushed anywhere, so they must not be uploaded to a
+         * real account on first sign-in.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE bookmarks_vault ADD COLUMN ownerUid TEXT")
+                db.execSQL("ALTER TABLE bookmark_folders ADD COLUMN ownerUid TEXT")
+                db.execSQL("ALTER TABLE pending_remote_deletes ADD COLUMN ownerUid TEXT")
+                db.execSQL("UPDATE bookmarks_vault SET pendingSync = 0 WHERE updatedAtMillis = 0")
+                db.execSQL("UPDATE bookmark_folders SET pendingSync = 0 WHERE updatedAtMillis = 0")
+            }
+        }
+
         fun getInstance(context: Context): XProDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -71,8 +95,14 @@ abstract class XProDatabase : RoomDatabase() {
                     XProDatabase::class.java,
                     "xpro_unlocked.db"
                 )
-                    .addMigrations(MIGRATION_3_4)
-                    .fallbackToDestructiveMigration(dropAllTables = true)
+                    .addMigrations(MIGRATION_3_4, MIGRATION_4_5)
+                    // Destructive fallback is a debug-only convenience. Shipping it in release
+                    // turns any forgotten migration into silent deletion of user bookmarks.
+                    .apply {
+                        if (BuildConfig.DEBUG) {
+                            fallbackToDestructiveMigration(dropAllTables = true)
+                        }
+                    }
                     .build()
                     .also { INSTANCE = it }
             }

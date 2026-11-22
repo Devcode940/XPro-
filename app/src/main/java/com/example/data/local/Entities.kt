@@ -73,7 +73,13 @@ data class PendingRemoteDeleteEntity(
     @PrimaryKey val id: String,
     /** "bookmark" or "folder", see [PendingRemoteDeleteKind]. */
     val kind: String,
-    val createdAtMillis: Long
+    val createdAtMillis: Long,
+    /**
+     * Cloud account this tombstone belongs to (null = device-local guest data).
+     * A tombstone is only replayed against the account that created it, so deleting a
+     * bookmark in account A can never delete account B's document with the same id.
+     */
+    val ownerUid: String? = null
 )
 
 object PendingRemoteDeleteKind {
@@ -90,7 +96,16 @@ data class BookmarkFolderEntity(
     val iconKey: String,
     @ColumnInfo(defaultValue = "0") val updatedAtMillis: Long = 0L,
     /** true when this row has local changes not yet pushed to Firestore. */
-    @ColumnInfo(defaultValue = "0") val pendingSync: Boolean = false
+    @ColumnInfo(defaultValue = "0") val pendingSync: Boolean = false,
+    /**
+     * Firebase uid that owns this row's cloud copy (null = never bound to an account).
+     *
+     * Rows are only pushed to — and reconciled against — the account that owns them. Without
+     * this column, signing into a second Google account uploads the first account's folders and
+     * then deletes them as "missing remotely". Nullable on purpose: the v4→v5 migration cannot
+     * invent an owner, so legacy rows stay unowned until the next sign-in claims them.
+     */
+    val ownerUid: String? = null
 )
 
 @Entity(tableName = "bookmarks_vault")
@@ -108,7 +123,12 @@ data class TypedBookmarkEntity(
     val createdAtMillis: Long,
     @ColumnInfo(defaultValue = "0") val updatedAtMillis: Long = 0L,
     /** true when this row has local changes not yet pushed to Firestore. */
-    @ColumnInfo(defaultValue = "0") val pendingSync: Boolean = false
+    @ColumnInfo(defaultValue = "0") val pendingSync: Boolean = false,
+    /**
+     * Firebase uid that owns this row's cloud copy (null = never bound to an account).
+     * See [BookmarkFolderEntity.ownerUid] for why reads/writes are scoped by owner.
+     */
+    val ownerUid: String? = null
 )
 
 @Entity(tableName = "user_profile")
@@ -342,15 +362,23 @@ fun BookmarkFolderEntity.toDomain(count: Int = 0) = BookmarkFolder(
     description = description,
     colorHex = colorHex,
     iconKey = iconKey,
-    count = count
+    count = count,
+    updatedAtMillis = updatedAtMillis
 )
 
-fun BookmarkFolder.toEntity() = BookmarkFolderEntity(
+fun BookmarkFolder.toEntity(
+    ownerUid: String? = null,
+    pendingSync: Boolean = false,
+    updatedAtMillis: Long = 0L
+) = BookmarkFolderEntity(
     id = id,
     name = name,
     description = description,
     colorHex = colorHex,
-    iconKey = iconKey
+    iconKey = iconKey,
+    updatedAtMillis = updatedAtMillis,
+    pendingSync = pendingSync,
+    ownerUid = ownerUid
 )
 
 fun TypedBookmarkEntity.toDomain() = TypedBookmarkItem(
@@ -368,7 +396,12 @@ fun TypedBookmarkEntity.toDomain() = TypedBookmarkItem(
     updatedAtMillis = updatedAtMillis
 )
 
-fun TypedBookmarkItem.toEntity() = TypedBookmarkEntity(
+fun TypedBookmarkItem.toEntity(
+    pendingSync: Boolean = false,
+    ownerUid: String? = null,
+    /** Remote snapshot timestamps win over the local estimate when reconciling. */
+    updatedAtMillis: Long = this.updatedAtMillis
+) = TypedBookmarkEntity(
     id = id,
     itemType = itemType.name,
     title = title,
@@ -381,7 +414,8 @@ fun TypedBookmarkItem.toEntity() = TypedBookmarkEntity(
     postId = postId,
     createdAtMillis = createdAtMillis,
     updatedAtMillis = updatedAtMillis,
-    pendingSync = false
+    pendingSync = pendingSync,
+    ownerUid = ownerUid
 )
 
 fun UserProfileEntity.toDomain() = UserProfile(

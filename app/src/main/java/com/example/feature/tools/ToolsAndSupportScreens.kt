@@ -5,8 +5,11 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
+import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -659,6 +662,34 @@ fun BrowserHistoryScreen(
     }
 }
 
+/**
+ * Plain holder (not Compose state) for the WebView created by `AndroidView`, so assigning it does
+ * not schedule a recomposition and `onDispose` can still reach the instance to destroy it.
+ */
+private class WebViewHandle {
+    var webView: WebView? = null
+}
+
+/**
+ * Private browsing accepts `https://` only. Anything else is either refused or upgraded, so a
+ * pasted `http://`/`javascript:`/`intent://` string can never reach the WebView.
+ */
+private fun normalizeHttpsUrl(raw: String): String? {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return null
+    return when {
+        trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+        trimmed.startsWith("http://", ignoreCase = true) -> "https://" + trimmed.substring("http://".length)
+        else -> "https://$trimmed"
+    }
+}
+
+/** Only http(s) navigations are allowed inside the private WebView (blocks file:, intent:, javascript:). */
+private fun isWebNavigationAllowed(url: String): Boolean {
+    val scheme = runCatching { Uri.parse(url).scheme?.lowercase() }.getOrNull()
+    return scheme == "https" || scheme == "http"
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun PrivateBrowsingScreen(
@@ -672,18 +703,25 @@ fun PrivateBrowsingScreen(
     val state by toolsViewModel.uiState.collectAsStateWithLifecycle()
     var urlInput by rememberSaveable(state.privateBrowserUrl) { mutableStateOf(state.privateBrowserUrl) }
     var currentTitle by remember { mutableStateOf("Private Browsing") }
-    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    val webViewHolder = remember { WebViewHandle() }
 
     DisposableEffect(Unit) {
         onDispose {
-            runCatching {
-                CookieManager.getInstance().removeAllCookies(null)
-                webViewRef?.apply {
-                    clearHistory()
-                    clearCache(true)
-                    clearFormData()
+            runCatching { CookieManager.getInstance().removeAllCookies(null) }
+            runCatching { WebStorage.getInstance().deleteAllData() }
+            webViewHolder.webView?.let { view ->
+                runCatching {
+                    view.stopLoading()
+                    view.loadUrl("about:blank")
+                    view.clearHistory()
+                    view.clearCache(true)
+                    view.clearFormData()
+                    // Destroying the WebView is what releases its Activity context; without this
+                    // the whole screen (and its native renderer) leaks for the process lifetime.
+                    view.destroy()
                 }
             }
+            webViewHolder.webView = null
         }
     }
 
@@ -701,13 +739,13 @@ fun PrivateBrowsingScreen(
             onBack = onBack,
             onOpenDrawer = onOpenDrawer,
             actions = {
-                IconButton(onClick = { webViewRef?.goBack() }) {
+                IconButton(onClick = { webViewHolder.webView?.goBack() }) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back page")
                 }
-                IconButton(onClick = { webViewRef?.goForward() }) {
+                IconButton(onClick = { webViewHolder.webView?.goForward() }) {
                     Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Forward page")
                 }
-                IconButton(onClick = { webViewRef?.reload() }) {
+                IconButton(onClick = { webViewHolder.webView?.reload() }) {
                     Icon(Icons.Filled.Refresh, contentDescription = "Reload")
                 }
             },
@@ -756,9 +794,10 @@ fun PrivateBrowsingScreen(
             Spacer(modifier = Modifier.width(8.dp))
             Button(
                 onClick = {
-                    val target = if (urlInput.startsWith("http://") || urlInput.startsWith("https://")) urlInput else "https://$urlInput"
-                    toolsViewModel.openPrivateUrl(target)
-                    webViewRef?.loadUrl(target)
+                    normalizeHttpsUrl(urlInput)?.let { target ->
+                        toolsViewModel.openPrivateUrl(target)
+                        webViewHolder.webView?.loadUrl(target)
+                    }
                 }
             ) {
                 Text("Go")
@@ -772,18 +811,35 @@ fun PrivateBrowsingScreen(
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = false
                     settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                    // minSdk 24: file access defaults to enabled on API 24–29, which lets a page
+                    // reach local files from inside a JS-enabled WebView.
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
+                    settings.setGeolocationEnabled(false)
+                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        settings.safeBrowsingEnabled = true
+                    }
                     webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: WebResourceRequest?
+                        ): Boolean {
+                            val target = request?.url?.toString() ?: return true
+                            return !isWebNavigationAllowed(target)
+                        }
+
                         override fun onPageFinished(view: WebView?, url: String?) {
                             currentTitle = view?.title ?: url ?: "Private Tab"
                             if (url != null) urlInput = url
                         }
                     }
                     loadUrl(state.privateBrowserUrl)
-                    webViewRef = this
+                    webViewHolder.webView = this
                 }
             },
             update = { view ->
-                webViewRef = view
+                webViewHolder.webView = view
             },
             modifier = Modifier
                 .weight(1f)

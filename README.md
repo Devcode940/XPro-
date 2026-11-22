@@ -80,7 +80,10 @@ configured with your Firebase project:
    firebase deploy --only firestore:rules --project <your-project-id>
    ```
    The blueprint for the two collections (`users/{uid}/bookmarks`, `users/{uid}/bookmark_folders`)
-   is documented in `firebase-blueprint.json`.
+   is documented in `firebase-blueprint.json`. Redeploy the rules whenever they change: the
+   current version rejects a blank bookmark `title` (the client derives a title from the content
+   before writing, so this app always satisfies it — an older build that sent `""` will now get a
+   permission-denied instead of syncing).
 
 ## Testing
 
@@ -178,7 +181,8 @@ files, `sharedpref` and external storage (`backup_rules.xml`, `data_extraction_r
 drafts, DMs, bookmarks, the download queue and the App Check debug token never leave the device
 via cloud backup or device transfer. App settings live in DataStore, so a restore starts from
 defaults instead of resurrecting private content. Firestore holds only bookmark/folder data per user,
-guarded by `firestore.rules` (auth-scoped, owner-only, field/type/length/enum validated), and
+guarded by `firestore.rules` (auth-scoped, owner-only, field/type/length/enum validated,
+non-empty titles and content), and
 locally that data is partitioned by `ownerUid` so one account's rows are never sent to another.
 `FirestoreErrorHandler` logs sanitized diagnostics only — no uid/email/provider PII.
 

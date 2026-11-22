@@ -203,13 +203,19 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
         val validItemType = itemType.uppercase().takeIf { it in setOf("POST", "VIDEO", "IMAGE", "LINK") } ?: "POST"
         val sanitizedFolderId = folderId?.takeIf { it.isNotBlank() && safeIdRegex.matches(it) && it.length <= 128 }
         val cleanContent = content.ifBlank { title.ifBlank { "Saved bookmark" } }.take(5000)
+        // The security rules reject a blank title, so derive one here — the same way content is
+        // derived — instead of retrying a write the backend will always refuse.
+        val cleanTitle = title.trim()
+            .ifBlank { cleanContent.lineSequence().firstOrNull()?.trim().orEmpty() }
+            .ifBlank { "Saved bookmark" }
+            .take(300)
 
         return try {
             val docRef = db.collection("users").document(uid).collection("bookmarks").document(sanitizedId)
             val existing = docRef.get().await()
             if (existing.exists()) {
                 val updates = mutableMapOf<String, Any>(
-                    "title" to title.take(300),
+                    "title" to cleanTitle,
                     "content" to cleanContent,
                     "itemType" to validItemType,
                     "updatedAt" to FieldValue.serverTimestamp()
@@ -222,7 +228,7 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
             } else {
                 val createMap = mutableMapOf<String, Any>(
                     "userId" to uid,
-                    "title" to title.take(300),
+                    "title" to cleanTitle,
                     "content" to cleanContent,
                     "authorName" to authorName.ifBlank { "XTRA User" }.take(120),
                     "authorHandle" to authorHandle.ifBlank { "@user" }.take(80),

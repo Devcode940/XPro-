@@ -295,6 +295,14 @@ test("Validation rejects oversized fields, missing required keys and invalid fol
     bookmarks.doc("bm_long_title").set({ ...baseBookmark, title: "x".repeat(301) })
   );
 
+  // title must be non-empty (a blank title makes a bookmark unfindable) and <= 300 characters
+  await assertFails(
+    bookmarks.doc("bm_empty_title").set({ ...baseBookmark, title: "" })
+  );
+  await assertSucceeds(
+    bookmarks.doc("bm_max_title").set({ ...baseBookmark, title: "x".repeat(300) })
+  );
+
   // content must be non-empty and <= 5000 characters
   await assertFails(
     bookmarks.doc("bm_empty_content").set({ ...baseBookmark, content: "" })
@@ -319,6 +327,11 @@ test("Validation rejects oversized fields, missing required keys and invalid fol
   // folderId must match ^[a-zA-Z0-9_-]+$
   await assertFails(
     bookmarks.doc("bm_bad_folder").set({ ...baseBookmark, folderId: "folder/../escape" })
+  );
+
+  // an update may not blank the title out
+  await assertFails(
+    bookmarks.doc("bm_valid").update({ title: "", updatedAt: new Date(Date.now() - 1000) })
   );
 
   // update may not touch userId or authorName

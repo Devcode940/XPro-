@@ -120,6 +120,8 @@ media-downloader/        # com.devcode.xpro.mediadownloader — reusable downloa
 tools/generate-debug-keystore.sh
 firebase-blueprint.json  # Firestore document blueprint (reference)
 firestore.rules          # Security rules (see firestore.test.js)
+app/schemas/             # Room schema exports (must be generated + committed, see its README)
+docs/bookmark-sync.md    # Design notes: ownership, push, reconcile, tombstones
 ```
 
 ### Bookmark cloud sync (design)
@@ -157,7 +159,8 @@ Room is the source of truth for reads; Firestore is the replication layer for wr
 
 Database version **5**, `exportSchema = true`, schemas emitted to `app/schemas/` by
 `:app:kspDebugKotlin` — **commit them** so `MigrationTestHelper` can run (this checkout still has
-no committed schema JSONs, which is why there is no automated migration test yet).
+no committed schema JSONs, which is why there is no automated migration test yet; see
+`app/schemas/README.md` for the exact commands and a test skeleton).
 
 - v3 → v4 added `updatedAtMillis`/`pendingSync` to `bookmarks_vault` and `bookmark_folders` plus
   the `pending_remote_deletes` tombstone table.

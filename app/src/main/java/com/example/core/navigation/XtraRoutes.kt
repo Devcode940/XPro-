@@ -1,5 +1,6 @@
 package com.example.core.navigation
 
+import android.net.Uri
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 
@@ -55,12 +56,26 @@ object XtraRoutes {
     const val ABOUT_XTRA = "about_xtra"
     const val SEND_FEEDBACK = "send_feedback"
 
-    fun profile(userId: String = "current_user") = "profile/$userId"
-    fun chatThread(conversationId: String) = "chat/$conversationId"
-    fun settings(section: String = SETTINGS_OVERVIEW) = "settings?section=$section"
+    /**
+     * Dynamic route segments are percent-encoded: ids come from user data and deep links, and a
+     * raw `/`, `?` or `#` in one would otherwise change which destination the route resolves to.
+     */
+    fun profile(userId: String = "current_user") = "profile/${Uri.encode(userId)}"
+    fun chatThread(conversationId: String) = "chat/${Uri.encode(conversationId)}"
+    fun settings(section: String = SETTINGS_OVERVIEW) = "settings?section=${Uri.encode(section)}"
 
     val topLevelTabRoutes = setOf(HOME, EXPLORE, NOTIFICATIONS, MESSAGES)
 }
+
+/**
+ * Route ids are the only externally reachable arguments (`xtra://profile/{userId}`,
+ * `xtra://chat/{conversationId}` are advertised by an exported activity), so anything that does
+ * not look like an app id falls back to a safe default instead of being used as-is.
+ */
+private val ROUTE_ID_PATTERN = Regex("^[A-Za-z0-9._-]{1,64}$")
+
+fun sanitizeRouteId(raw: String?, fallback: String): String =
+    raw?.takeIf { ROUTE_ID_PATTERN.matches(it) } ?: fallback
 
 fun NavHostController.navigateSingleTopTo(route: String) {
     navigate(route) {

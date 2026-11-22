@@ -77,9 +77,11 @@ configured with your Firebase project:
 5. **Firestore**: the project uses a named database (`firestore_database_id` in
    `firebase_applet_config.xml`). Deploy rules/indexes:
    ```bash
-   firebase deploy --only firestore:rules --project <your-project-id>
+   npm run deploy:rules -- --project <your-project-id>
    ```
-   The blueprint for the two collections (`users/{uid}/bookmarks`, `users/{uid}/bookmark_folders`)
+   `firebase.json` targets the named database from `firebase_applet_config.xml`, so no database
+   flag is needed. There is no `.firebaserc` in the repo on purpose — the project id is yours, not
+   the demo one. The blueprint for the two collections (`users/{uid}/bookmarks`, `users/{uid}/bookmark_folders`)
    is documented in `firebase-blueprint.json`. Redeploy the rules whenever they change: the
    current version rejects a blank bookmark `title` (the client derives a title from the content
    before writing, so this app always satisfies it — an older build that sent `""` will now get a

@@ -196,7 +196,7 @@ This codebase ships **demo behavior** that is not a bug but also not production 
 - [x] Demo seeding gated to debug builds (`BuildConfig.DEBUG` in `XProRepository.ensureSeeded`)
 - [ ] Rebrand or re-scope the “Grok” assistant; wire a real model name + rate limiting
 - [ ] Real `google-services.json` per variant; App Check enforced in production
-- [ ] Push release build with `isMinifyEnabled` (already on) and smoke-test R8 output
+- [x] Push release build with `isMinifyEnabled` (already on) and smoke-test R8 output — CI now assembles a signed release APK with throwaway keystore
 - [ ] Replace `versionCode = 1`/`1.0`, wire Play delivery, set up keystore custody
 - [ ] Firestore: re-register the Android app under the new `com.devcode.xpro` package name + SHA fingerprints
 - [ ] Real analytics/crash reporting decision (none bundled today)

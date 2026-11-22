@@ -25,6 +25,16 @@ private const val TAG = "GrokViewModel"
 private const val GROK_MODEL_NAME = "gemini-3.8-flash"
 private const val GROK_TIMEOUT_MS = 60_000L
 
+/**
+ * Hard caps so a single request cannot grow without bound. There is no server-side rate limit or
+ * quota guard yet, and prompt tokens are billed to the Firebase project.
+ */
+private const val MAX_PROMPT_CHARS = 8_000
+private const val MAX_HISTORY_MESSAGES = 12
+private const val MAX_HISTORY_CHARS_PER_MESSAGE = 4_000
+private const val MAX_FEED_CONTEXT_POSTS = 5
+private const val MAX_FEED_CONTEXT_CHARS = 4_000
+
 enum class GrokMode(val label: String, val subtitle: String) {
     REGULAR("Regular", "Sharp, direct X-powered answers"),
     FUN("Fun Mode", "Witty, unfiltered X banter + facts")
@@ -118,7 +128,9 @@ class GrokViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendMessage(rawPrompt: String, appendUserBubble: Boolean = true) {
-        val prompt = rawPrompt.trim()
+        // Truncate before it reaches the model: the text field has no hard length limit and the
+        // whole prompt is billed.
+        val prompt = rawPrompt.trim().take(MAX_PROMPT_CHARS)
         if (prompt.isEmpty() || _uiState.value.isGenerating) return
 
         val currentMode = _uiState.value.mode
@@ -161,11 +173,13 @@ class GrokViewModel(application: Application) : AndroidViewModel(application) {
                     prompt
                 }
 
-                val historyContent: List<Content> = historyMessages.takeLast(12).map { msg ->
-                    content(role = if (msg.role == GrokRole.USER) "user" else "model") {
-                        text(msg.text)
+                val historyContent: List<Content> = historyMessages
+                    .takeLast(MAX_HISTORY_MESSAGES)
+                    .map { msg ->
+                        content(role = if (msg.role == GrokRole.USER) "user" else "model") {
+                            text(msg.text.take(MAX_HISTORY_CHARS_PER_MESSAGE))
+                        }
                     }
-                }
 
                 val model = when (currentMode) {
                     GrokMode.REGULAR -> regularModel
@@ -282,7 +296,9 @@ class GrokViewModel(application: Application) : AndroidViewModel(application) {
         return try {
             repository.ensureSeeded()
             val trends = repository.trends.first().filterNot { it.isPromoted }.take(4)
-            val posts = repository.allPosts.first().filterNot { it.isSponsored }.take(5)
+            val posts = repository.allPosts.first()
+                .filterNot { it.isSponsored }
+                .take(MAX_FEED_CONTEXT_POSTS)
             buildString {
                 if (trends.isNotEmpty()) {
                     appendLine("Current XPro Trends:")
@@ -297,7 +313,7 @@ class GrokViewModel(application: Application) : AndroidViewModel(application) {
                         appendLine("- ${p.authorName} (${p.authorHandle}): $titlePrefix${p.content.take(180)}")
                     }
                 }
-            }.trim()
+            }.trim().take(MAX_FEED_CONTEXT_CHARS)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

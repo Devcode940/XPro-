@@ -77,16 +77,21 @@ configured with your Firebase project:
 5. **Firestore**: the project uses a named database (`firestore_database_id` in
    `firebase_applet_config.xml`). Deploy rules/indexes:
    ```bash
-   firebase deploy --only firestore:rules --project <your-project-id>
+   npm run deploy:rules -- --project <your-project-id>
    ```
-   The blueprint for the two collections (`users/{uid}/bookmarks`, `users/{uid}/bookmark_folders`)
-   is documented in `firebase-blueprint.json`.
+   `firebase.json` targets the named database from `firebase_applet_config.xml`, so no database
+   flag is needed. There is no `.firebaserc` in the repo on purpose — the project id is yours, not
+   the demo one. The blueprint for the two collections (`users/{uid}/bookmarks`, `users/{uid}/bookmark_folders`)
+   is documented in `firebase-blueprint.json`. Redeploy the rules whenever they change: the
+   current version rejects a blank bookmark `title` (the client derives a title from the content
+   before writing, so this app always satisfies it — an older build that sent `""` will now get a
+   permission-denied instead of syncing).
 
 ## Testing
 
 | Suite | Command | What it covers |
 |---|---|---|
-| Host unit tests (Robolectric) | `gradle :app:testDebugUnitTest` | Repository, paging, undo-send, bookmark sync merge/reconcile (`SyncMergeTest`), settings, UI smoke |
+| Host unit tests (Robolectric) | `gradle :app:testDebugUnitTest` | Repository, paging, undo-send, bookmark sync merge/reconcile + account scoping/tombstone rules (`SyncMergeTest`), settings, UI smoke |
 | Module unit tests | `gradle :media-downloader:testDebugUnitTest` | URL validation/SSRF guards, download queue persistence, filename dedup |
 | Firestore rules tests | `npm ci && npm run test:rules` | Emulator-backed access control for both collections (needs a JDK; runs in CI) |
 | Instrumented | `gradle :app:connectedDebugAndroidTest` | Needs a device/emulator |
@@ -120,6 +125,8 @@ media-downloader/        # com.devcode.xpro.mediadownloader — reusable downloa
 tools/generate-debug-keystore.sh
 firebase-blueprint.json  # Firestore document blueprint (reference)
 firestore.rules          # Security rules (see firestore.test.js)
+app/schemas/             # Room schema exports (must be generated + committed, see its README)
+docs/bookmark-sync.md    # Design notes: ownership, push, reconcile, tombstones
 ```
 
 ### Bookmark cloud sync (design)
@@ -128,32 +135,57 @@ Room is the source of truth for reads; Firestore is the replication layer for wr
 
 - **Write-through**: every local bookmark/folder mutation is mirrored to Firestore immediately
   when authenticated (guest mode = device-local only).
+- **Account scoping (v5)**: every bookmark, folder and tombstone row carries an `ownerUid`.
+  Pushes and reconciles only ever touch rows owned by the account that is signed in, so signing
+  into a second Google account can no longer upload — or delete — the first account’s data.
+  Rows created before any sign-in are *unowned*; the first sign-in claims them (that is how local
+  data reaches the user’s cloud), and rows that were never synced (`updatedAtMillis = 0`, e.g.
+  seeded demo content) are deliberately left unowned so demo data is never uploaded.
 - **Pending flags + tombstones**: rows created/modified offline get `pendingSync = 1`; the next
-  sync pushes them. Deletes enqueue a row in `pending_remote_deletes`; replayed on next
-  authenticated sync so stale remote docs can’t resurrect locally.
-- **Reconcile on snapshot**: remote snapshots upsert non-pending local rows and remove synced
-  rows that vanished remotely. Rows with `updatedAtMillis = 0` (seeded or pre-v4 data) are never
-  reconciled away or auto-pushed as a safety net.
+  sync pushes them. Deletes enqueue a row in `pending_remote_deletes` (owned by the same account)
+  and are replayed on the next authenticated sync so stale remote docs can’t resurrect locally.
+  Deletes of never-synced rows are not tombstoned — there is nothing remote to delete.
+- **Reconcile on authoritative snapshots only**: `FirestoreSyncResult.Success.isAuthoritative`
+  is true only for a server snapshot. Cache-sourced snapshots and the "Firebase unavailable"
+  placeholder are never fed into reconcile, because an empty non-authoritative result used to
+  delete every synced row. Reconcile removes stale rows by diffing ids in chunks
+  (`SQL_IN_CHUNK_SIZE`) instead of one giant `NOT IN (...)` list.
+- **Retry**: a failed push keeps the row pending and is retried on demand (`retrySync()`, wired to
+  the sync icon in the Bookmarks top bar / `sync_bookmarks_btn`) as well as on the next
+  sign-in/app start.
 - Conflict policy is deliberately simple (local pending edit wins; otherwise remote wins) — there
   is no operational transform or CRDT. Timestamps are **server timestamps** (`FieldValue.serverTimestamp()`),
-  matching the security rules’ `request.time` checks.
+  matching the security rules’ `request.time` checks. Folder rows keep the remote `updatedAt`, so
+  a timestamp-based policy is possible later.
 - Guest/offline: every write path above degrades to local-only; failures are surfaced in the
   bookmarks banner instead of being silently swallowed.
 
 ### Room schema
 
-`exportSchema = true` and schemas are emitted to `app/schemas/` (commit them). v3 → v4 added
-`updatedAtMillis`/`pendingSync` to `bookmarks_vault` and `bookmark_folders` plus the
-`pending_remote_deletes` tombstone table. v4 rows upgraded from v3 are flagged `pendingSync = 1`
-so the first post-upgrade sync safely pushes them. `fallbackToDestructiveMigration` remains as a
-last-resort guard, not a strategy — write migrations.
+Database version **5**, `exportSchema = true`, schemas emitted to `app/schemas/` by
+`:app:kspDebugKotlin` — **commit them** so `MigrationTestHelper` can run (this checkout still has
+no committed schema JSONs, which is why there is no automated migration test yet; see
+`app/schemas/README.md` for the exact commands and a test skeleton).
+
+- v3 → v4 added `updatedAtMillis`/`pendingSync` to `bookmarks_vault` and `bookmark_folders` plus
+  the `pending_remote_deletes` tombstone table.
+- v4 → v5 added nullable `ownerUid` to `bookmarks_vault`, `bookmark_folders` and
+  `pending_remote_deletes` (account scoping, see above). It also resets `pendingSync` on rows with
+  `updatedAtMillis = 0`, undoing the v4 migration’s “flag every legacy row as pending” behaviour
+  which would otherwise upload seeded demo bookmarks on first sign-in.
+- `fallbackToDestructiveMigration` is **debug-only** now: shipping it in release turned any
+  forgotten migration into silent deletion of user bookmarks. Write migrations.
 
 ## Backup & privacy
 
-`android:allowBackup` stays enabled but backup rules now exclude the Room database and all
-app-private files (`backup_rules.xml`, `data_extraction_rules.xml`) — drafts, DMs and bookmarks
-never leave the device via cloud backup. Firestore holds only bookmark/folder data per user,
-guarded by `firestore.rules` (auth-scoped, owner-only, field/type/length/enum validated).
+`android:allowBackup` stays enabled but backup rules exclude the Room database, all app-private
+files, `sharedpref` and external storage (`backup_rules.xml`, `data_extraction_rules.xml`) —
+drafts, DMs, bookmarks, the download queue and the App Check debug token never leave the device
+via cloud backup or device transfer. App settings live in DataStore, so a restore starts from
+defaults instead of resurrecting private content. Firestore holds only bookmark/folder data per user,
+guarded by `firestore.rules` (auth-scoped, owner-only, field/type/length/enum validated,
+non-empty titles and content), and
+locally that data is partitioned by `ownerUid` so one account's rows are never sent to another.
 `FirestoreErrorHandler` logs sanitized diagnostics only — no uid/email/provider PII.
 
 ## Honesty notes
@@ -175,7 +207,7 @@ This codebase ships **demo behavior** that is not a bug but also not production 
 - [x] Demo seeding gated to debug builds (`BuildConfig.DEBUG` in `XProRepository.ensureSeeded`)
 - [ ] Rebrand or re-scope the “Grok” assistant; wire a real model name + rate limiting
 - [ ] Real `google-services.json` per variant; App Check enforced in production
-- [ ] Push release build with `isMinifyEnabled` (already on) and smoke-test R8 output
+- [x] Push release build with `isMinifyEnabled` (already on) and smoke-test R8 output — CI now assembles a signed release APK with throwaway keystore
 - [ ] Replace `versionCode = 1`/`1.0`, wire Play delivery, set up keystore custody
 - [ ] Firestore: re-register the Android app under the new `com.devcode.xpro` package name + SHA fingerprints
 - [ ] Real analytics/crash reporting decision (none bundled today)
@@ -187,6 +219,10 @@ This codebase ships **demo behavior** that is not a bug but also not production 
 - No offline write queue for anything except bookmark/folder sync (posts, messages etc. are local-only fiction anyway).
 - undo-send is in-memory: killing the process during the countdown drops the pending post (it is not yet in Room).
 - `Content-Security`-style hardening for the QR scanner/WebView tools is out of scope.
-- The v3→v4 Room migration is hand-verified SQL but not yet exercised by an automated Robolectric migration test; `app/schemas/` must carry the exported v3 and v4 JSONs first (generated by `:app:kspDebugKotlin`, commit the output).
+- The v3→v4→v5 Room migrations are hand-verified SQL but not yet exercised by an automated Robolectric migration test; `app/schemas/` must carry the exported v3/v4/v5 JSONs first (generated by `:app:kspDebugKotlin`, commit the output).
+- Account switching keeps each account's rows on the device and hides them from sync, but there is no per-account UI switch or “remove this account's local copy” action yet.
+- The private-browsing WebView now blocks non-http(s) URLs, disables file/content access and destroys itself on dispose, but JavaScript stays enabled because most sites break without it.
+- Downloads still poll every 750 ms while work is active (the queue blob is now only rewritten when a status/location/error changes, not on every progress tick).
+- UI copy is hardcoded Kotlin string literals (no `stringResource`/`values-xx`), so the Settings language picker is deliberately disabled until strings are externalized.
 - `gradle-wrapper.jar` is intentionally absent; CI installs Gradle 9.3.1 via SDKMAN. Run `gradle wrapper` once and commit the result to restore standard `./gradlew` UX.
 - Release `isMinifyEnabled` uses conservative keep rules; if reflection-based crashes appear, extend `proguard-rules.pro` rather than disabling R8.

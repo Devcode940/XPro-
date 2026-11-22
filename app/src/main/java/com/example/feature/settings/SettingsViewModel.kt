@@ -36,7 +36,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     private val settingsRepo = SettingsRepository(application)
     private val xProRepo = XProRepository.getInstance(application)
-    private val downloader = SystemMediaDownloader(application)
+    private val downloader = SystemMediaDownloader.getInstance(application)
 
     private val storageState = MutableStateFlow(StorageStats())
     private val sessionsState = MutableStateFlow(defaultSessions())
@@ -140,7 +140,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun setImprovedContrast(enabled: Boolean) = viewModelScope.launch { settingsRepo.setImprovedContrast(enabled) }
 
     override fun onCleared() {
-        downloader.cleanup()
+        // The downloader is process-scoped; detach this screen's callback instead of
+        // unregistering the shared completion receiver.
+        downloader.release()
         super.onCleared()
     }
 }

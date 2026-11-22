@@ -18,6 +18,18 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+private data class ProfileActor(
+    val controls: ProfileControls,
+    val currentProfile: UserProfile
+)
+
+private data class ProfileContent(
+    val allPosts: List<PostItem>,
+    val suggestedUsers: List<SuggestedUser>,
+    val folders: List<BookmarkFolder>,
+    val trends: List<com.example.data.model.TrendItem>
+)
+
 sealed interface ProfileUiState {
     data object Loading : ProfileUiState
     data class Error(val message: String, val userId: String) : ProfileUiState
@@ -62,24 +74,26 @@ class ProfileViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Grouped `combine` to keep element types — see BookmarksViewModel for the rationale. */
     val uiState: StateFlow<ProfileUiState> = combine(
-        controls,
-        repository.userProfile,
-        repository.allPosts,
-        repository.suggestedUsers,
-        repository.bookmarkFolders,
-        repository.trends
-    ) { values ->
-        val ctrl = values[0] as ProfileControls
-        val currentProfile = values[1] as UserProfile
-        @Suppress("UNCHECKED_CAST")
-        val allPosts = values[2] as List<PostItem>
-        @Suppress("UNCHECKED_CAST")
-        val suggestedUsers = values[3] as List<SuggestedUser>
-        @Suppress("UNCHECKED_CAST")
-        val folders = values[4] as List<BookmarkFolder>
-        @Suppress("UNCHECKED_CAST")
-        val trends = values[5] as List<com.example.data.model.TrendItem>
+        combine(controls, repository.userProfile) { controlState, profile ->
+            ProfileActor(controls = controlState, currentProfile = profile)
+        },
+        combine(repository.allPosts, repository.suggestedUsers, repository.bookmarkFolders, repository.trends) { posts, suggested, folders, trends ->
+            ProfileContent(
+                allPosts = posts,
+                suggestedUsers = suggested,
+                folders = folders,
+                trends = trends
+            )
+        }
+    ) { actor, content ->
+        val ctrl = actor.controls
+        val currentProfile = actor.currentProfile
+        val allPosts = content.allPosts
+        val suggestedUsers = content.suggestedUsers
+        val folders = content.folders
+        val trends = content.trends
 
         if (ctrl.isLoading || !ctrl.isInitialized) {
             return@combine ProfileUiState.Loading

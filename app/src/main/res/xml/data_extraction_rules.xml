@@ -1,19 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Production data-extraction policy (Android 12+): the Room database and app-private files
-  are never extracted to cloud backup or device transfer. Shared preferences are allowed.
+  Data-extraction policy (Android 12+): cloud backup and device-to-device transfer.
+
+  Same intent as backup_rules.xml — the Room database (bookmarks, drafts, DMs, feedback) and
+  all app-private files never leave the device. SharedPreferences (download queue, App Check
+  debug token) are excluded as well; app settings in DataStore are a `file`-domain entry and
+  therefore fall back to defaults after a restore on purpose.
 -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="database" path="xpro_unlocked.db" />
         <exclude domain="database" path="xpro_unlocked.db-wal" />
         <exclude domain="database" path="xpro_unlocked.db-shm" />
+        <exclude domain="sharedpref" path="." />
         <exclude domain="file" path="." />
+        <exclude domain="external" path="." />
     </cloud-backup>
     <device-transfer>
         <exclude domain="database" path="xpro_unlocked.db" />
         <exclude domain="database" path="xpro_unlocked.db-wal" />
         <exclude domain="database" path="xpro_unlocked.db-shm" />
+        <exclude domain="sharedpref" path="." />
         <exclude domain="file" path="." />
+        <exclude domain="external" path="." />
     </device-transfer>
 </data-extraction-rules>

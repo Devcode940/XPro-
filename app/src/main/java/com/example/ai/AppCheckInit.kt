@@ -23,7 +23,17 @@ fun configureAppCheck(context: Context, intent: Intent?) {
         }
 
         if (BuildConfig.DEBUG) {
-            val debugToken = intent?.getStringExtra(DEBUG_TOKEN_EXTRA)
+            // Only honour the debug token from a launcher-style start (`adb shell am start ... --es
+            // FIREBASE_APPCHECK_DEBUG_TOKEN <token>`). MainActivity is exported and accepts
+            // `xtra://` deep links, so without this guard any app on the device could launch it
+            // with an attacker-chosen App Check token for the rest of the debug install.
+            val launchedFromLauncher = intent == null || intent.action == Intent.ACTION_MAIN
+            val debugToken = if (launchedFromLauncher) {
+                intent?.getStringExtra(DEBUG_TOKEN_EXTRA)
+            } else {
+                Log.w(TAG, "Ignoring FIREBASE_APPCHECK_DEBUG_TOKEN from a non-launcher intent.")
+                null
+            }
 
             if (!debugToken.isNullOrEmpty()) {
                 val persistenceKey = FirebaseApp.getInstance().persistenceKey

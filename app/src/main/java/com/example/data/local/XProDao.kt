@@ -96,11 +96,13 @@ interface XProDao {
     suspend fun updateFollowStatusForAuthor(authorId: String, isFollowing: Boolean)
 
     // Remote-delete tombstones (offline deletes replayed on next sync)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertPendingRemoteDelete(item: PendingRemoteDeleteEntity)
 
-    @Query("SELECT * FROM pending_remote_deletes ORDER BY createdAtMillis ASC")
-    suspend fun getPendingRemoteDeletes(): List<PendingRemoteDeleteEntity>
+    /** Tombstones for [ownerUid] only — a guest never replays another account's deletes. */
+    @Query("SELECT * FROM pending_remote_deletes WHERE ownerUid = :ownerUid ORDER BY createdAtMillis ASC")
+    suspend fun getPendingRemoteDeletes(ownerUid: String): List<PendingRemoteDeleteEntity>
 
     @Query("DELETE FROM pending_remote_deletes WHERE id = :id")
     suspend fun clearPendingRemoteDelete(id: String)
@@ -108,20 +110,56 @@ interface XProDao {
     @Query("SELECT EXISTS(SELECT 1 FROM pending_remote_deletes WHERE id = :id AND kind = :kind)")
     suspend fun isPendingRemoteDelete(id: String, kind: String): Boolean
 
+    // --- Account ownership -------------------------------------------------
+    // "Unowned" rows are device-local guest data. They are claimed by the first account that
+    // signs in (so a user's pre-sign-in bookmarks reach their cloud) and are then never visible
+    // to a different account. Never-synced demo rows (updatedAtMillis = 0, not pending) stay
+    // unowned so seeded persona content is never uploaded.
+
+    @Query(
+        "UPDATE bookmarks_vault SET ownerUid = :ownerUid " +
+            "WHERE (ownerUid IS NULL OR ownerUid = '') AND (pendingSync = 1 OR updatedAtMillis > 0)"
+    )
+    suspend fun claimUnownedTypedBookmarks(ownerUid: String)
+
+    @Query(
+        "UPDATE bookmark_folders SET ownerUid = :ownerUid " +
+            "WHERE (ownerUid IS NULL OR ownerUid = '') AND (pendingSync = 1 OR updatedAtMillis > 0)"
+    )
+    suspend fun claimUnownedFolders(ownerUid: String)
+
+    @Query(
+        "UPDATE pending_remote_deletes SET ownerUid = :ownerUid WHERE ownerUid IS NULL OR ownerUid = ''"
+    )
+    suspend fun claimUnownedPendingRemoteDeletes(ownerUid: String)
+
     @Query("SELECT * FROM bookmark_folders WHERE id = :folderId LIMIT 1")
     suspend fun getBookmarkFolderById(folderId: String): BookmarkFolderEntity?
 
-    @Query("SELECT * FROM bookmark_folders WHERE pendingSync = 1")
-    suspend fun getPendingSyncFolders(): List<BookmarkFolderEntity>
+    @Query("SELECT * FROM bookmark_folders WHERE pendingSync = 1 AND ownerUid = :ownerUid")
+    suspend fun getPendingSyncFolders(ownerUid: String): List<BookmarkFolderEntity>
 
-    @Query("UPDATE bookmark_folders SET pendingSync = 0 WHERE id IN (:ids)")
-    suspend fun clearPendingFolders(ids: List<String>)
+    @Query("UPDATE bookmark_folders SET pendingSync = 0 WHERE ownerUid = :ownerUid AND id IN (:ids)")
+    suspend fun clearPendingFolders(ownerUid: String, ids: List<String>)
 
-    @Query("DELETE FROM bookmark_folders WHERE pendingSync = 0 AND updatedAtMillis > 0 AND id NOT IN (:remoteIds)")
-    suspend fun deleteSyncedFoldersNotIn(remoteIds: List<String>)
+    /** Ids of rows that have been pushed at least once — the candidates for reconcile-by-diff. */
+    @Query(
+        "SELECT id FROM bookmark_folders WHERE ownerUid = :ownerUid AND pendingSync = 0 AND updatedAtMillis > 0"
+    )
+    suspend fun getSyncedFolderIds(ownerUid: String): List<String>
 
-    @Query("DELETE FROM bookmark_folders WHERE pendingSync = 0 AND updatedAtMillis > 0")
-    suspend fun deleteAllSyncedFolders()
+    /**
+     * Delete by explicit id list rather than `id NOT IN (:remoteIds)`: the remote list grows with
+     * the user's library and would otherwise blow past SQLite's bound-parameter limit, failing
+     * sync exactly when someone has a lot of bookmarks. Callers chunk this.
+     */
+    @Query("DELETE FROM bookmark_folders WHERE ownerUid = :ownerUid AND id IN (:ids)")
+    suspend fun deleteFoldersByIds(ownerUid: String, ids: List<String>)
+
+    @Query(
+        "DELETE FROM bookmark_folders WHERE ownerUid = :ownerUid AND pendingSync = 0 AND updatedAtMillis > 0"
+    )
+    suspend fun deleteAllSyncedFolders(ownerUid: String)
 
     @Query("SELECT * FROM bookmark_folders ORDER BY name ASC")
     fun observeBookmarkFolders(): Flow<List<BookmarkFolderEntity>>
@@ -142,17 +180,27 @@ interface XProDao {
     @Query("SELECT * FROM bookmarks_vault WHERE id = :bookmarkId LIMIT 1")
     suspend fun getTypedBookmarkById(bookmarkId: String): TypedBookmarkEntity?
 
-    @Query("SELECT * FROM bookmarks_vault WHERE pendingSync = 1")
-    suspend fun getPendingSyncTypedBookmarks(): List<TypedBookmarkEntity>
+    @Query("SELECT * FROM bookmarks_vault WHERE postId = :postId LIMIT 1")
+    suspend fun getTypedBookmarkByPostId(postId: String): TypedBookmarkEntity?
 
-    @Query("UPDATE bookmarks_vault SET pendingSync = 0 WHERE id IN (:ids)")
-    suspend fun clearPendingTypedBookmarks(ids: List<String>)
+    @Query("SELECT * FROM bookmarks_vault WHERE pendingSync = 1 AND ownerUid = :ownerUid")
+    suspend fun getPendingSyncTypedBookmarks(ownerUid: String): List<TypedBookmarkEntity>
 
-    @Query("DELETE FROM bookmarks_vault WHERE pendingSync = 0 AND updatedAtMillis > 0 AND id NOT IN (:remoteIds)")
-    suspend fun deleteSyncedTypedBookmarksNotIn(remoteIds: List<String>)
+    @Query("UPDATE bookmarks_vault SET pendingSync = 0 WHERE ownerUid = :ownerUid AND id IN (:ids)")
+    suspend fun clearPendingTypedBookmarks(ownerUid: String, ids: List<String>)
 
-    @Query("DELETE FROM bookmarks_vault WHERE pendingSync = 0 AND updatedAtMillis > 0")
-    suspend fun deleteAllSyncedTypedBookmarks()
+    @Query(
+        "SELECT id FROM bookmarks_vault WHERE ownerUid = :ownerUid AND pendingSync = 0 AND updatedAtMillis > 0"
+    )
+    suspend fun getSyncedTypedBookmarkIds(ownerUid: String): List<String>
+
+    @Query("DELETE FROM bookmarks_vault WHERE ownerUid = :ownerUid AND id IN (:ids)")
+    suspend fun deleteTypedBookmarksByIds(ownerUid: String, ids: List<String>)
+
+    @Query(
+        "DELETE FROM bookmarks_vault WHERE ownerUid = :ownerUid AND pendingSync = 0 AND updatedAtMillis > 0"
+    )
+    suspend fun deleteAllSyncedTypedBookmarks(ownerUid: String)
 
     @Query("SELECT * FROM bookmarks_vault ORDER BY createdAtMillis DESC")
     fun observeTypedBookmarks(): Flow<List<TypedBookmarkEntity>>

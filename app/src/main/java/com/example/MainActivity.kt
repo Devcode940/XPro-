@@ -104,6 +104,7 @@ import com.example.core.designsystem.configureXtraEdgeToEdge
 import com.example.core.designsystem.rememberIsKeyboardOpen
 import com.example.core.navigation.XtraRoutes
 import com.example.core.navigation.navigateSingleTopTo
+import com.example.core.navigation.sanitizeRouteId
 import com.example.core.scroll.LocalAutoHideUiController
 import com.example.core.scroll.LocalBottomBarClearance
 import com.example.core.scroll.LocalHasPhoneBottomBar
@@ -577,7 +578,10 @@ fun XProApp(
                                     arguments = listOf(navArgument("conversationId") { type = NavType.StringType }),
                                     deepLinks = listOf(navDeepLink { uriPattern = "xtra://chat/{conversationId}" })
                                 ) { entry ->
-                                    val convId = entry.arguments?.getString("conversationId") ?: "conv_kairo"
+                                    val convId = sanitizeRouteId(
+                                        entry.arguments?.getString("conversationId"),
+                                        fallback = "conv_kairo"
+                                    )
                                     ChatThreadScreen(
                                         conversationId = convId,
                                         socialViewModel = socialViewModel,
@@ -718,7 +722,10 @@ fun XProApp(
                                     arguments = listOf(navArgument("userId") { type = NavType.StringType }),
                                     deepLinks = listOf(navDeepLink { uriPattern = "xtra://profile/{userId}" })
                                 ) { entry ->
-                                    val userId = entry.arguments?.getString("userId") ?: "current_user"
+                                    val userId = sanitizeRouteId(
+                                        entry.arguments?.getString("userId"),
+                                        fallback = "current_user"
+                                    )
                                     LaunchedEffect(userId) {
                                         profileViewModel.loadProfile(userId)
                                     }

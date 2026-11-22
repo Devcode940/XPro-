@@ -129,6 +129,23 @@ private data class UiControlState(
     val toastMessage: String? = null
 )
 
+private data class FeedSession(
+    val controls: UiControlState,
+    val profile: UserProfile
+)
+
+private data class FeedLibrary(
+    val posts: List<PostItem>,
+    val folders: List<BookmarkFolder>,
+    val trends: List<TrendItem>,
+    val suggestedUsers: List<SuggestedUser>
+)
+
+private data class FeedOffline(
+    val cachedCount: Int,
+    val unreadCount: Int
+)
+
 private data class FeedQueryKey(
     val feedTab: FeedTab,
     val feedFilter: FeedFilter,
@@ -147,9 +164,15 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
     private val firestoreSync by lazy { FirestoreBookmarkSyncRepository(application) }
     @Volatile private var cloudUid: String? = null
 
-    /** Called by MainActivity whenever the signed-in Firebase uid changes (null = guest). */
+    /**
+     * Called by MainActivity whenever the signed-in Firebase uid changes (null = guest).
+     *
+     * Also tells the repository who owns new rows: writes are stamped with the active account, so
+     * switching accounts cannot re-upload (or reconcile away) the previous account's bookmarks.
+     */
     fun setCloudSyncUid(uid: String?) {
         cloudUid = uid
+        repository.setActiveOwner(uid)
     }
 
     private fun pushBookmarkUpsert(item: TypedBookmarkItem) {
@@ -167,7 +190,7 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
                 linkUrl = item.linkUrl,
                 folderId = item.folderId
             )) {
-                SyncWriteResult.Synced -> repository.markBookmarksSynced(listOf(item.id))
+                SyncWriteResult.Synced -> repository.markBookmarksSynced(uid, listOf(item.id))
                 else -> Unit // stays pendingSync; retried on next sign-in/sync
             }
         }
@@ -184,7 +207,7 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun pushFolderUpsert(id: String, name: String, description: String, colorHex: Long, iconKey: String) {
         val uid = cloudUid ?: return
         when (firestoreSync.upsertFolder(uid, id, name.trim(), description.trim(), colorHex, iconKey)) {
-            SyncWriteResult.Synced -> repository.markFoldersSynced(listOf(id))
+            SyncWriteResult.Synced -> repository.markFoldersSynced(uid, listOf(id))
             else -> Unit
         }
     }
@@ -227,28 +250,31 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
         }
         .cachedIn(viewModelScope)
 
+    /** Grouped `combine` to keep element types — see BookmarksViewModel for the rationale. */
     val uiState: StateFlow<XProUiState> = combine(
-        controls,
-        repository.userProfile,
-        repository.allPosts,
-        repository.bookmarkFolders,
-        repository.trends,
-        repository.suggestedUsers,
-        repository.offlineCachedCount,
-        repository.offlineUnreadCount
-    ) { values ->
-        val ctrl = values[0] as UiControlState
-        val profile = values[1] as UserProfile
-        @Suppress("UNCHECKED_CAST")
-        val posts = values[2] as List<PostItem>
-        @Suppress("UNCHECKED_CAST")
-        val folders = values[3] as List<BookmarkFolder>
-        @Suppress("UNCHECKED_CAST")
-        val trends = values[4] as List<TrendItem>
-        @Suppress("UNCHECKED_CAST")
-        val suggested = values[5] as List<SuggestedUser>
-        val cachedCount = values[6] as Int
-        val unreadCount = values[7] as Int
+        combine(controls, repository.userProfile) { controlState, profile ->
+            FeedSession(controls = controlState, profile = profile)
+        },
+        combine(
+            repository.allPosts,
+            repository.bookmarkFolders,
+            repository.trends,
+            repository.suggestedUsers
+        ) { posts, folders, trends, suggested ->
+            FeedLibrary(posts = posts, folders = folders, trends = trends, suggestedUsers = suggested)
+        },
+        combine(repository.offlineCachedCount, repository.offlineUnreadCount) { cached, unread ->
+            FeedOffline(cachedCount = cached, unreadCount = unread)
+        }
+    ) { session, library, offline ->
+        val ctrl = session.controls
+        val profile = session.profile
+        val posts = library.posts
+        val folders = library.folders
+        val trends = library.trends
+        val suggested = library.suggestedUsers
+        val cachedCount = offline.cachedCount
+        val unreadCount = offline.unreadCount
 
         val adFree = profile.adFreeEnabled
         val adFilteredPosts = if (adFree) posts.filterNot { it.isSponsored } else posts
@@ -651,8 +677,11 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
 
     fun removeBookmark(postId: String) {
         viewModelScope.launch {
+            // Read the owner first: a row left over from another account must not delete this
+            // account's document with the same id.
+            val owner = repository.postBookmarkOwner(postId)
             repository.removeBookmark(postId)
-            pushBookmarkDelete("tb_$postId")
+            if (repository.isRemoteCopyOwnedBy(owner, cloudUid)) pushBookmarkDelete("tb_$postId")
             controls.update { it.copy(bookmarkTargetPost = null) }
             showToast("Removed from bookmarks")
         }
@@ -688,8 +717,9 @@ class XProViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteBookmarkFolder(folderId: String) {
         viewModelScope.launch {
+            val owner = repository.folderOwner(folderId)
             repository.deleteBookmarkFolder(folderId)
-            pushFolderDelete(folderId)
+            if (repository.isRemoteCopyOwnedBy(owner, cloudUid)) pushFolderDelete(folderId)
             if (controls.value.selectedFolderId == folderId) {
                 controls.update { it.copy(selectedFolderId = null) }
             }

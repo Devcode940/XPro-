@@ -14,6 +14,18 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+private data class ToolsContent(
+    val savedPages: List<SavedPageItem>,
+    val browserHistory: List<BrowserHistoryItem>,
+    val feedbackList: List<FeedbackSubmission>,
+    val banner: String?
+)
+
+private data class ToolsBrowser(
+    val query: String,
+    val privateUrl: String
+)
+
 data class ToolsUiState(
     val savedPages: List<SavedPageItem> = emptyList(),
     val browserHistory: List<BrowserHistoryItem> = emptyList(),
@@ -47,22 +59,30 @@ class ToolsViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repo.ensureSeeded() }
     }
 
+    /** Grouped `combine` to keep element types — see BookmarksViewModel for the rationale. */
     val uiState: StateFlow<ToolsUiState> = combine(
-        repo.savedPages,
-        repo.browserHistory,
-        historyQuery,
-        repo.feedbackSubmissions,
-        privateUrl,
-        bannerState
-    ) { values ->
-        @Suppress("UNCHECKED_CAST")
+        combine(
+            repo.savedPages,
+            repo.browserHistory,
+            repo.feedbackSubmissions,
+            bannerState
+        ) { savedPages, browserHistory, feedback, banner ->
+            ToolsContent(
+                savedPages = savedPages,
+                browserHistory = browserHistory,
+                feedbackList = feedback,
+                banner = banner
+            )
+        },
+        combine(historyQuery, privateUrl) { query, url -> ToolsBrowser(query = query, privateUrl = url) }
+    ) { content, browser ->
         ToolsUiState(
-            savedPages = values[0] as List<SavedPageItem>,
-            browserHistory = values[1] as List<BrowserHistoryItem>,
-            historySearchQuery = values[2] as String,
-            feedbackList = values[3] as List<FeedbackSubmission>,
-            privateBrowserUrl = values[4] as String,
-            statusBanner = values[5] as String?
+            savedPages = content.savedPages,
+            browserHistory = content.browserHistory,
+            historySearchQuery = browser.query,
+            feedbackList = content.feedbackList,
+            privateBrowserUrl = browser.privateUrl,
+            statusBanner = content.banner
         )
     }.stateIn(
         scope = viewModelScope,

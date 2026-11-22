@@ -51,7 +51,21 @@ data class SyncedBookmarkFolderDoc(
 
 sealed interface FirestoreSyncResult<out T> {
     data object Loading : FirestoreSyncResult<Nothing>
-    data class Success<T>(val data: T) : FirestoreSyncResult<T>
+
+    /**
+     * A result from the server (or a placeholder emitted because sync is unavailable).
+     *
+     * [isAuthoritative] distinguishes a real, server-confirmed snapshot from (a) a snapshot
+     * served out of the local Firestore cache and (b) the empty placeholder returned when
+     * Firebase is missing or the caller is not authenticated as [SyncedBookmarkDoc.userId].
+     * Only authoritative snapshots may drive a destructive reconcile — treating a cache or
+     * placeholder result as "the server says zero documents" would delete every synced row.
+     */
+    data class Success<T>(
+        val data: T,
+        val isAuthoritative: Boolean = false
+    ) : FirestoreSyncResult<T>
+
     data class Error(val message: String, val cause: Throwable) : FirestoreSyncResult<Nothing>
 }
 
@@ -119,7 +133,13 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
                             DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                         )
                     } ?: emptyList()
-                    trySend(FirestoreSyncResult.Success(docs))
+                    // Cache-sourced snapshots are shown as-is but must never trigger a reconcile.
+                    trySend(
+                        FirestoreSyncResult.Success(
+                            data = docs,
+                            isAuthoritative = snapshot != null && !snapshot.metadata.isFromCache
+                        )
+                    )
                 }
             awaitClose { registration.remove() }
         }
@@ -151,7 +171,12 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
                             DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                         )
                     } ?: emptyList()
-                    trySend(FirestoreSyncResult.Success(docs))
+                    trySend(
+                        FirestoreSyncResult.Success(
+                            data = docs,
+                            isAuthoritative = snapshot != null && !snapshot.metadata.isFromCache
+                        )
+                    )
                 }
             awaitClose { registration.remove() }
         }
@@ -178,13 +203,19 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
         val validItemType = itemType.uppercase().takeIf { it in setOf("POST", "VIDEO", "IMAGE", "LINK") } ?: "POST"
         val sanitizedFolderId = folderId?.takeIf { it.isNotBlank() && safeIdRegex.matches(it) && it.length <= 128 }
         val cleanContent = content.ifBlank { title.ifBlank { "Saved bookmark" } }.take(5000)
+        // The security rules reject a blank title, so derive one here — the same way content is
+        // derived — instead of retrying a write the backend will always refuse.
+        val cleanTitle = title.trim()
+            .ifBlank { cleanContent.lineSequence().firstOrNull()?.trim().orEmpty() }
+            .ifBlank { "Saved bookmark" }
+            .take(300)
 
         return try {
             val docRef = db.collection("users").document(uid).collection("bookmarks").document(sanitizedId)
             val existing = docRef.get().await()
             if (existing.exists()) {
                 val updates = mutableMapOf<String, Any>(
-                    "title" to title.take(300),
+                    "title" to cleanTitle,
                     "content" to cleanContent,
                     "itemType" to validItemType,
                     "updatedAt" to FieldValue.serverTimestamp()
@@ -197,7 +228,7 @@ class FirestoreBookmarkSyncRepository(private val context: Context) {
             } else {
                 val createMap = mutableMapOf<String, Any>(
                     "userId" to uid,
-                    "title" to title.take(300),
+                    "title" to cleanTitle,
                     "content" to cleanContent,
                     "authorName" to authorName.ifBlank { "XTRA User" }.take(120),
                     "authorHandle" to authorHandle.ifBlank { "@user" }.take(80),

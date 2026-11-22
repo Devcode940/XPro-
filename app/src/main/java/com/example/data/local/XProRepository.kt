@@ -43,6 +43,20 @@ class XProRepository(private val dao: XProDao) {
     @Volatile
     private var seeded = false
 
+    /**
+     * The cloud account currently signed in (null = guest). Every row created while this is set
+     * is stamped with it so sync can never push — or reconcile away — another account's data.
+     * Set from the UI layer (`BookmarksViewModel` / `XProViewModel`), never read from Firebase here.
+     */
+    @Volatile
+    private var activeOwnerUid: String? = null
+
+    fun setActiveOwner(uid: String?) {
+        activeOwnerUid = uid?.takeIf { it.isNotBlank() }
+    }
+
+    private fun ownerStamp(): String? = activeOwnerUid
+
     val allPosts: Flow<List<PostItem>> = dao.observeAllPosts().map { entities ->
         entities.map { it.toDomain() }
     }
@@ -385,7 +399,9 @@ class XProRepository(private val dao: XProDao) {
             createdAtMillis = existingTb?.createdAtMillis ?: now,
             updatedAtMillis = now
         )
-        dao.insertTypedBookmark(item.toEntity().copy(pendingSync = true))
+        dao.insertTypedBookmark(
+            item.toEntity(pendingSync = true, ownerUid = existingTb?.ownerUid ?: ownerStamp())
+        )
         // Re-bookmarking something previously deleted locally clears the tombstone so it can sync again.
         dao.clearPendingRemoteDelete(item.id)
         return item
@@ -393,6 +409,7 @@ class XProRepository(private val dao: XProDao) {
 
     suspend fun removeBookmark(postId: String) {
         val post = dao.getPostById(postId) ?: return
+        val existing = dao.getTypedBookmarkByPostId(postId)
         dao.updatePost(
             post.copy(
                 isBookmarked = false,
@@ -401,9 +418,20 @@ class XProRepository(private val dao: XProDao) {
         )
         dao.deleteTypedBookmarkByPostId(postId)
         // Tombstone so the next sync deletes the remote doc instead of resurrecting it locally.
-        dao.insertPendingRemoteDelete(
-            PendingRemoteDeleteEntity("tb_$postId", PendingRemoteDeleteKind.BOOKMARK, System.currentTimeMillis())
-        )
+        // Owned by whoever owned the row: a guest-mode delete must not touch a signed-in account.
+        // Rows that were never synced (seed/demo, updatedAtMillis = 0, not pending) have no remote
+        // counterpart, so they are not tombstoned — otherwise a demo delete could delete a real
+        // document that happens to share the generated id.
+        if (existing == null || existing.pendingSync || existing.updatedAtMillis > 0L) {
+            dao.insertPendingRemoteDelete(
+                PendingRemoteDeleteEntity(
+                    id = "tb_$postId",
+                    kind = PendingRemoteDeleteKind.BOOKMARK,
+                    createdAtMillis = System.currentTimeMillis(),
+                    ownerUid = existing?.ownerUid ?: ownerStamp()
+                )
+            )
+        }
     }
 
     suspend fun addTypedBookmark(
@@ -432,15 +460,31 @@ class XProRepository(private val dao: XProDao) {
             createdAtMillis = now,
             updatedAtMillis = now
         )
-        dao.insertTypedBookmark(item.toEntity().copy(pendingSync = true))
+        dao.insertTypedBookmark(item.toEntity(pendingSync = true, ownerUid = ownerStamp()))
         dao.clearPendingRemoteDelete(item.id)
         return item
     }
 
-    suspend fun mergeRemoteBookmarks(remoteItems: List<TypedBookmarkItem>) {
+    /** Claims unowned (guest) rows for [ownerUid] before a push so the user's local data syncs. */
+    suspend fun claimUnownedRows(ownerUid: String) {
+        if (ownerUid.isBlank()) return
+        dao.claimUnownedTypedBookmarks(ownerUid)
+        dao.claimUnownedFolders(ownerUid)
+        dao.claimUnownedPendingRemoteDeletes(ownerUid)
+    }
+
+    /**
+     * Reconciles a *server* snapshot of [ownerUid]'s bookmarks into Room.
+     *
+     * Callers must only pass authoritative snapshots (not cache-sourced ones) — an empty list
+     * here deletes every synced local row for that account. Rows owned by another account are
+     * never touched.
+     */
+    suspend fun mergeRemoteBookmarks(ownerUid: String, remoteItems: List<TypedBookmarkItem>) {
+        if (ownerUid.isBlank()) return // guest mode has no remote authority
         if (remoteItems.isEmpty()) {
             // Authoritative empty snapshot: drop synced local rows that no longer exist remotely.
-            dao.deleteAllSyncedTypedBookmarks()
+            dao.deleteAllSyncedTypedBookmarks(ownerUid)
             return
         }
         for (item in remoteItems) {
@@ -448,26 +492,42 @@ class XProRepository(private val dao: XProDao) {
             if (dao.isPendingRemoteDelete(item.id, PendingRemoteDeleteKind.BOOKMARK)) continue
             val existing = dao.getTypedBookmarkById(item.id)
             if (existing?.pendingSync == true) continue // local unsynced edits win; pushed on next sync
+            if (existing?.ownerUid != null && existing.ownerUid != ownerUid) continue // other account
             val effectiveUpdated = if (item.updatedAtMillis > 0L) item.updatedAtMillis else item.createdAtMillis
-            dao.insertTypedBookmark(item.toEntity().copy(updatedAtMillis = effectiveUpdated, pendingSync = false))
+            dao.insertTypedBookmark(
+                item.toEntity(updatedAtMillis = effectiveUpdated, pendingSync = false, ownerUid = ownerUid)
+            )
         }
-        dao.deleteSyncedTypedBookmarksNotIn(remoteItems.map { it.id })
+        val remoteIds = remoteItems.map { it.id }.toHashSet()
+        val staleIds = dao.getSyncedTypedBookmarkIds(ownerUid).filterNot { it in remoteIds }
+        deleteInChunks(staleIds) { chunk -> dao.deleteTypedBookmarksByIds(ownerUid, chunk) }
     }
 
-    suspend fun getPendingSyncBookmarks(): List<TypedBookmarkItem> =
-        dao.getPendingSyncTypedBookmarks().map { it.toDomain() }
-
-    suspend fun markBookmarksSynced(ids: List<String>) {
-        if (ids.isNotEmpty()) dao.clearPendingTypedBookmarks(ids)
+    suspend fun getPendingSyncBookmarks(ownerUid: String): List<TypedBookmarkItem> {
+        if (ownerUid.isBlank()) return emptyList()
+        return dao.getPendingSyncTypedBookmarks(ownerUid).map { it.toDomain() }
     }
 
-    suspend fun getPendingRemoteDeletes(): List<PendingRemoteDeleteEntity> = dao.getPendingRemoteDeletes()
+    suspend fun markBookmarksSynced(ownerUid: String, ids: List<String>) {
+        if (ownerUid.isNotBlank() && ids.isNotEmpty()) dao.clearPendingTypedBookmarks(ownerUid, ids)
+    }
+
+    suspend fun getPendingRemoteDeletes(ownerUid: String): List<PendingRemoteDeleteEntity> {
+        if (ownerUid.isBlank()) return emptyList()
+        return dao.getPendingRemoteDeletes(ownerUid)
+    }
 
     suspend fun clearPendingRemoteDelete(id: String) = dao.clearPendingRemoteDelete(id)
 
-    suspend fun mergeRemoteFolders(remoteFolders: List<BookmarkFolder>) {
+    /**
+     * Same contract as [mergeRemoteBookmarks]: authoritative server snapshots only. Remote
+     * timestamps are preserved (they used to be replaced with `now`, which made folder
+     * last-writer-wins impossible).
+     */
+    suspend fun mergeRemoteFolders(ownerUid: String, remoteFolders: List<BookmarkFolder>) {
+        if (ownerUid.isBlank()) return
         if (remoteFolders.isEmpty()) {
-            dao.deleteAllSyncedFolders()
+            dao.deleteAllSyncedFolders(ownerUid)
             return
         }
         val now = System.currentTimeMillis()
@@ -475,16 +535,50 @@ class XProRepository(private val dao: XProDao) {
             if (dao.isPendingRemoteDelete(folder.id, PendingRemoteDeleteKind.FOLDER)) continue
             val existing = dao.getBookmarkFolderById(folder.id)
             if (existing?.pendingSync == true) continue
-            dao.insertFolder(folder.toEntity().copy(updatedAtMillis = now, pendingSync = false))
+            if (existing?.ownerUid != null && existing.ownerUid != ownerUid) continue
+            val updatedAt = folder.updatedAtMillis.takeIf { it > 0L } ?: now
+            dao.insertFolder(
+                folder.toEntity(ownerUid = ownerUid, pendingSync = false, updatedAtMillis = updatedAt)
+            )
         }
-        dao.deleteSyncedFoldersNotIn(remoteFolders.map { it.id })
+        val remoteIds = remoteFolders.map { it.id }.toHashSet()
+        val staleIds = dao.getSyncedFolderIds(ownerUid).filterNot { it in remoteIds }
+        deleteInChunks(staleIds) { chunk -> dao.deleteFoldersByIds(ownerUid, chunk) }
     }
 
-    suspend fun getPendingSyncFolders(): List<BookmarkFolder> =
-        dao.getPendingSyncFolders().map { it.toDomain() }
+    suspend fun getPendingSyncFolders(ownerUid: String): List<BookmarkFolder> {
+        if (ownerUid.isBlank()) return emptyList()
+        return dao.getPendingSyncFolders(ownerUid).map { it.toDomain() }
+    }
 
-    suspend fun markFoldersSynced(ids: List<String>) {
-        if (ids.isNotEmpty()) dao.clearPendingFolders(ids)
+    suspend fun markFoldersSynced(ownerUid: String, ids: List<String>) {
+        if (ownerUid.isNotBlank() && ids.isNotEmpty()) dao.clearPendingFolders(ownerUid, ids)
+    }
+
+    /**
+     * True when [rowOwnerUid]'s remote copy may be written through [uid].
+     *
+     * Unowned rows (`null`) are device-local and are adopted on sign-in; a row owned by a
+     * different account must never be pushed, updated or deleted on this account's behalf.
+     */
+    fun isRemoteCopyOwnedBy(rowOwnerUid: String?, uid: String?): Boolean =
+        !uid.isNullOrBlank() && (rowOwnerUid == null || rowOwnerUid == uid)
+
+    /** Owner of a vault row, read *before* deleting it so the caller can scope the remote delete. */
+    suspend fun typedBookmarkOwner(bookmarkId: String): String? =
+        dao.getTypedBookmarkById(bookmarkId)?.ownerUid
+
+    /** Owner of the vault row linked to [postId], if any. */
+    suspend fun postBookmarkOwner(postId: String): String? =
+        dao.getTypedBookmarkByPostId(postId)?.ownerUid
+
+    /** Owner of a folder row, read *before* deleting it. */
+    suspend fun folderOwner(folderId: String): String? =
+        dao.getBookmarkFolderById(folderId)?.ownerUid
+
+    /** Keeps every SQL `IN (...)` under SQLite's bound-parameter limit on large libraries. */
+    private suspend fun deleteInChunks(ids: List<String>, delete: suspend (List<String>) -> Unit) {
+        ids.chunked(SQL_IN_CHUNK_SIZE).forEach { chunk -> delete(chunk) }
     }
 
     suspend fun assignTypedBookmarkFolder(bookmarkId: String, folderId: String?) {
@@ -493,10 +587,19 @@ class XProRepository(private val dao: XProDao) {
     }
 
     suspend fun deleteTypedBookmark(bookmarkId: String, linkedPostId: String?) {
+        val existing = dao.getTypedBookmarkById(bookmarkId)
         dao.deleteTypedBookmarkById(bookmarkId)
-        dao.insertPendingRemoteDelete(
-            PendingRemoteDeleteEntity(bookmarkId, PendingRemoteDeleteKind.BOOKMARK, System.currentTimeMillis())
-        )
+        // Tombstone carries the row's owner so a guest delete is never replayed into an account.
+        if (existing == null || existing.pendingSync || existing.updatedAtMillis > 0L) {
+            dao.insertPendingRemoteDelete(
+                PendingRemoteDeleteEntity(
+                    id = bookmarkId,
+                    kind = PendingRemoteDeleteKind.BOOKMARK,
+                    createdAtMillis = System.currentTimeMillis(),
+                    ownerUid = existing?.ownerUid ?: ownerStamp()
+                )
+            )
+        }
         if (linkedPostId != null) {
             dao.getPostById(linkedPostId)?.let { post ->
                 dao.updatePost(post.copy(isBookmarked = false, bookmarkFolderId = null))
@@ -514,19 +617,28 @@ class XProRepository(private val dao: XProDao) {
                 colorHex = colorHex,
                 iconKey = iconKey,
                 updatedAtMillis = System.currentTimeMillis(),
-                pendingSync = true
+                pendingSync = true,
+                ownerUid = ownerStamp()
             )
         )
         return id
     }
 
     suspend fun deleteBookmarkFolder(folderId: String) {
+        val existing = dao.getBookmarkFolderById(folderId)
         dao.clearFolderFromPosts(folderId)
         dao.clearFolderFromTypedBookmarks(folderId, System.currentTimeMillis())
         dao.deleteFolderById(folderId)
-        dao.insertPendingRemoteDelete(
-            PendingRemoteDeleteEntity(folderId, PendingRemoteDeleteKind.FOLDER, System.currentTimeMillis())
-        )
+        if (existing == null || existing.pendingSync || existing.updatedAtMillis > 0L) {
+            dao.insertPendingRemoteDelete(
+                PendingRemoteDeleteEntity(
+                    id = folderId,
+                    kind = PendingRemoteDeleteKind.FOLDER,
+                    createdAtMillis = System.currentTimeMillis(),
+                    ownerUid = existing?.ownerUid ?: ownerStamp()
+                )
+            )
+        }
     }
 
     suspend fun updateUserProfile(
@@ -803,6 +915,12 @@ class XProRepository(private val dao: XProDao) {
     }
 
     companion object {
+        /**
+         * SQLite's historical bound-parameter ceiling is 999; stay well under it so a
+         * reconcile of a large bookmark library cannot throw "too many SQL variables".
+         */
+        private const val SQL_IN_CHUNK_SIZE = 400
+
         @Volatile
         private var INSTANCE: XProRepository? = null
 

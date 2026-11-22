@@ -47,7 +47,16 @@ interface DownloadCallback {
     fun onDownloadFailed(item: MediaDownloadItem, reason: String)
 }
 
-class SystemMediaDownloader(private val context: Context) {
+/**
+ * Owns the system download queue for the whole process.
+ *
+ * One instance is shared through [getInstance]: the queue is a single in-memory list persisted to
+ * one SharedPreferences key, so a second instance would (a) hold a stale copy of the list and
+ * overwrite the other's entries, (b) register a duplicate `ACTION_DOWNLOAD_COMPLETE` receiver, and
+ * (c) drop downloads issued from a different screen. Call [release] from `onCleared` instead of
+ * tearing the instance down; the receiver is registration-cheap and lives for the process.
+ */
+class SystemMediaDownloader internal constructor(private val context: Context) {
 
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -353,12 +362,17 @@ class SystemMediaDownloader(private val context: Context) {
                 bytesDownloaded = bytesDownloaded,
                 bytesTotal = bytesTotal
             )
-            // Persist only on actual change — this is called every poll tick (~750ms).
+            // Called every poll tick (~750 ms): the UI always gets the fresh counters, but the
+            // queue blob is only rewritten when something that must survive a restart changes.
+            // Persisting each tick meant ~1.3 full-JSON rewrites per second per active download.
             if (updatedItem != existing) {
                 _downloads.update { list ->
                     list.map { if (it.downloadId == downloadId) updatedItem else it }
                 }
-                persistQueue(_downloads.value)
+                val durableChange = updatedItem.status != existing.status ||
+                    updatedItem.localUri != existing.localUri ||
+                    updatedItem.errorReason != existing.errorReason
+                if (durableChange) persistQueue(_downloads.value)
             }
 
             if (mappedStatus == DownloadStatus.SUCCEEDED && existing.status != DownloadStatus.SUCCEEDED) {
@@ -485,9 +499,37 @@ class SystemMediaDownloader(private val context: Context) {
         _downloads.value = parsed
     }
 
+    /**
+     * Detach a ViewModel's callback without unregistering the process-wide receiver.
+     * Use this from `ViewModel.onCleared`; [cleanup] is for tests and process teardown.
+     */
+    fun release() {
+        activeCallback = null
+    }
+
     companion object {
         private const val PREFS_NAME = "xpro_media_downloader_prefs"
         private const val KEY_QUEUE_JSON = "download_queue_json"
+
+        @Volatile
+        private var sharedInstance: SystemMediaDownloader? = null
+
+        /** The single queue owner for this process. */
+        fun getInstance(context: Context): SystemMediaDownloader {
+            return sharedInstance ?: synchronized(this) {
+                sharedInstance ?: SystemMediaDownloader(context.applicationContext).also {
+                    sharedInstance = it
+                }
+            }
+        }
+
+        @androidx.annotation.VisibleForTesting
+        internal fun resetInstanceForTesting() {
+            synchronized(this) {
+                sharedInstance?.cleanup()
+                sharedInstance = null
+            }
+        }
     }
 
     private fun mapFailureReason(reasonCode: Int): String {

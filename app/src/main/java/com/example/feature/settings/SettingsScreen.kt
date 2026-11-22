@@ -617,10 +617,22 @@ fun SettingsScreen(
                             FilterChip(
                                 selected = settings.appLanguage == lang,
                                 onClick = { viewModel.setAppLanguage(lang) },
+                                // All UI copy is still hardcoded Kotlin literals (no
+                                // stringResource/values-xx), so switching the value would change
+                                // nothing on screen. Offering a live control that silently does
+                                // nothing is worse than offering a disabled one.
+                                enabled = lang == "English",
                                 label = { Text(lang) }
                             )
                         }
                     }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "The interface ships in English only. Translations become available " +
+                            "once UI strings move to string resources.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colorScheme.onSurfaceVariant
+                    )
                 }
             }
         }

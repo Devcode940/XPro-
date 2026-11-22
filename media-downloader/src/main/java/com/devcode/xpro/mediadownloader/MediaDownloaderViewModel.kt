@@ -24,7 +24,7 @@ data class MediaDownloaderUiState(
 
 class MediaDownloaderViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val downloader = SystemMediaDownloader(application)
+    private val downloader = SystemMediaDownloader.getInstance(application)
     private val urlInputState = MutableStateFlow("")
     private val validationState = MutableStateFlow<UrlValidationResult?>(null)
     private val bannerState = MutableStateFlow<Pair<String?, Boolean>>(null to false)
@@ -157,7 +157,9 @@ class MediaDownloaderViewModel(application: Application) : AndroidViewModel(appl
     }
 
     override fun onCleared() {
-        downloader.cleanup()
+        // The downloader is process-scoped; detach this screen's callback instead of
+        // unregistering the shared completion receiver.
+        downloader.release()
         super.onCleared()
     }
 }

@@ -128,7 +128,8 @@ object GoogleAuthHelper {
             AuthResultState.Error("No Google account found on this device. Add one in Android Settings or continue in Guest mode.")
         } catch (e: Exception) {
             Log.w(TAG, "Google sign-in failed", e)
-            AuthResultState.Error(e.message ?: "Google Sign-In failed. Check network connection.")
+            // Never surface raw SDK exception text (it can name internal error classes/hosts).
+            AuthResultState.Error("Google Sign-In couldn't be completed. Check your connection and try again.")
         }
     }
 

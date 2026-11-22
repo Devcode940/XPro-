@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Firestore security rules: runs the emulator-backed suite in firestore.test.js
   # against firestore.rules. Requires a JDK for the Firestore emulator (setup-java).
@@ -50,6 +57,12 @@ jobs:
           curl -s "https://get.sdkman.io" | bash
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           sdk install gradle 9.3.1
+
+      # Caches ~/.gradle (dependencies + build cache) between runs. No gradle-version input on
+      # purpose: the SDKMAN step above installs the pinned Gradle, and this action only manages
+      # the cache (a committed wrapper would make the download unnecessary).
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Assemble debug APK
         run: |

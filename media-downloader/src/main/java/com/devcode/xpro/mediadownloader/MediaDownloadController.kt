@@ -362,12 +362,17 @@ class SystemMediaDownloader internal constructor(private val context: Context) {
                 bytesDownloaded = bytesDownloaded,
                 bytesTotal = bytesTotal
             )
-            // Persist only on actual change — this is called every poll tick (~750ms).
+            // Called every poll tick (~750 ms): the UI always gets the fresh counters, but the
+            // queue blob is only rewritten when something that must survive a restart changes.
+            // Persisting each tick meant ~1.3 full-JSON rewrites per second per active download.
             if (updatedItem != existing) {
                 _downloads.update { list ->
                     list.map { if (it.downloadId == downloadId) updatedItem else it }
                 }
-                persistQueue(_downloads.value)
+                val durableChange = updatedItem.status != existing.status ||
+                    updatedItem.localUri != existing.localUri ||
+                    updatedItem.errorReason != existing.errorReason
+                if (durableChange) persistQueue(_downloads.value)
             }
 
             if (mappedStatus == DownloadStatus.SUCCEEDED && existing.status != DownloadStatus.SUCCEEDED) {

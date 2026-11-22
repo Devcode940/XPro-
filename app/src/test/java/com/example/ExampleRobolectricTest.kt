@@ -69,6 +69,20 @@ class ExampleRobolectricTest {
         XProDatabase.resetInstanceForTesting()
     }
 
+    /**
+     * Waits for [tag] to exist instead of asserting straight after `waitForIdle()`.
+     *
+     * `waitForIdle()` only promises that Compose has no pending frame work — the tag can still be
+     * missing while the seeding coroutine launched by the ViewModel is in flight, which made the
+     * compose tests fail intermittently on CI (identical commit, different run).
+     */
+    private fun waitForTag(tag: String, timeoutMillis: Long = 10_000L) {
+        composeTestRule.waitUntil(timeoutMillis = timeoutMillis) {
+            Thread.sleep(10)
+            composeTestRule.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty()
+        }
+    }
+
     @Test
     fun `app name matches XPro and applicationId is com devcode xpro`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -158,6 +172,7 @@ class ExampleRobolectricTest {
             }
         }
         composeTestRule.waitForIdle()
+        waitForTag("ad_shield_pill")
         composeTestRule.onNodeWithTag("ad_shield_pill").assertIsDisplayed()
         composeTestRule.onNodeWithTag("post_card_post_ad_1").assertDoesNotExist()
     }
@@ -212,7 +227,9 @@ class ExampleRobolectricTest {
             }
         }
         composeTestRule.waitForIdle()
+        waitForTag("offline_mode_pill")
         composeTestRule.onNodeWithTag("offline_mode_pill").assertIsDisplayed()
+        waitForTag("open_media_downloader_btn")
         composeTestRule.onNodeWithTag("open_media_downloader_btn").assertIsDisplayed()
     }
 

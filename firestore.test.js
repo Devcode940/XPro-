@@ -271,3 +271,86 @@ test("Validation rejects invalid enum types, future timestamps, and invalid fold
     })
   );
 });
+
+test("Validation rejects oversized fields, missing required keys and invalid folder ids", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const created = new Date(Date.now() - 5000);
+  const baseBookmark = {
+    userId: ALICE_UID,
+    title: "Valid title",
+    content: "Valid content",
+    authorName: "Alice",
+    authorHandle: "@alice",
+    itemType: "POST",
+    createdAt: created,
+    updatedAt: created,
+  };
+  const bookmarks = aliceDb.collection("users").doc(ALICE_UID).collection("bookmarks");
+
+  // Baseline: the shape these negative cases mutate is accepted.
+  await assertSucceeds(bookmarks.doc("bm_valid").set(baseBookmark));
+
+  // title > 300 characters
+  await assertFails(
+    bookmarks.doc("bm_long_title").set({ ...baseBookmark, title: "x".repeat(301) })
+  );
+
+  // content must be non-empty and <= 5000 characters
+  await assertFails(
+    bookmarks.doc("bm_empty_content").set({ ...baseBookmark, content: "" })
+  );
+  await assertFails(
+    bookmarks.doc("bm_long_content").set({ ...baseBookmark, content: "x".repeat(5001) })
+  );
+
+  // required key omitted
+  const missingKey = { ...baseBookmark };
+  delete missingKey.authorHandle;
+  await assertFails(bookmarks.doc("bm_missing_key").set(missingKey));
+
+  // optional mediaUrl is length-checked
+  await assertFails(
+    bookmarks.doc("bm_long_media").set({
+      ...baseBookmark,
+      mediaUrl: "https://cdn.example.com/" + "a".repeat(1000),
+    })
+  );
+
+  // folderId must match ^[a-zA-Z0-9_-]+$
+  await assertFails(
+    bookmarks.doc("bm_bad_folder").set({ ...baseBookmark, folderId: "folder/../escape" })
+  );
+
+  // update may not touch userId or authorName
+  await assertFails(
+    bookmarks.doc("bm_valid").update({ userId: BOB_UID, updatedAt: new Date(Date.now() - 1000) })
+  );
+  await assertFails(
+    bookmarks.doc("bm_valid").update({ authorName: "Mallory", updatedAt: new Date(Date.now() - 1000) })
+  );
+
+  // folder name length and required keys
+  const folders = aliceDb.collection("users").doc(ALICE_UID).collection("bookmark_folders");
+  const baseFolder = {
+    userId: ALICE_UID,
+    name: "Research",
+    description: "Notes",
+    colorHex: 0xFF1D9BF0,
+    iconKey: "code",
+    createdAt: created,
+    updatedAt: created,
+  };
+  await assertSucceeds(folders.doc("folder_valid").set(baseFolder));
+  await assertFails(folders.doc("folder_long_name").set({ ...baseFolder, name: "x".repeat(61) }));
+  const folderMissingDescription = { ...baseFolder };
+  delete folderMissingDescription.description;
+  await assertFails(folders.doc("folder_missing").set(folderMissingDescription));
+
+  // folder updates may not rewrite createdAt
+  await assertFails(
+    folders.doc("folder_valid").update({
+      createdAt: new Date(Date.now() - 1000),
+      updatedAt: new Date(Date.now() - 1000),
+    })
+  );
+});

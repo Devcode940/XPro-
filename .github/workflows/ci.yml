@@ -39,13 +39,12 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - uses: android-actions/setup-android@v3
+      # ubuntu-latest ships the Android SDK (ANDROID_HOME) preinstalled; no extra setup step needed.
 
-      # The repo does not pin a Gradle wrapper JAR (see README). Install Gradle 9.3.1
-      # (matching gradle/wrapper/gradle-wrapper.properties) via SDKMAN.
       - name: Generate debug keystore (git-ignored, required for assembleDebug)
         run: bash tools/generate-debug-keystore.sh
 
+      # No committed gradle-wrapper.jar: install Gradle 9.3.1 (matching gradle/wrapper/gradle-wrapper.properties) via SDKMAN.
       - name: Install Gradle 9.3.1
         run: |
           curl -s "https://get.sdkman.io" | bash
